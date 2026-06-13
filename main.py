@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import sqlite3
 import csv
 import os
+import sys
 from datetime import date, timedelta, datetime
 import matplotlib
 matplotlib.use("TkAgg")
@@ -10,7 +11,11 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.ticker import FuncFormatter
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+DB_PATH = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+)
 
 LANGUAGES = {
     "af": "Afrikaans", "sq": "Albanian",  "ar": "Arabic",     "hy": "Armenian",
@@ -62,6 +67,48 @@ _CHART_COLORS = [
     "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
     "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
 ]
+
+
+def _months_ago(n: int) -> "date":
+    today = date.today()
+    year, month = today.year, today.month - n
+    while month <= 0:
+        month += 12
+        year -= 1
+    try:
+        return date(year, month, today.day)
+    except ValueError:
+        return date(year, month + 1, 1) - timedelta(days=1)
+
+
+def _period_key(d_str: str, grouping: str) -> str:
+    d = datetime.strptime(d_str, "%Y-%m-%d").date()
+    if grouping == "Day":
+        return d.isoformat()
+    if grouping == "Week":
+        return (d - timedelta(days=d.weekday())).isoformat()
+    return d_str[:7]
+
+
+def _all_periods(s: "date", e: "date", grouping: str):
+    result = []
+    if grouping == "Day":
+        d = s
+        while d <= e:
+            result.append((d.isoformat(), d.strftime("%b %d")))
+            d += timedelta(days=1)
+    elif grouping == "Week":
+        ws = s - timedelta(days=s.weekday())
+        while ws <= e:
+            result.append((ws.isoformat(), ws.strftime("%b %d")))
+            ws += timedelta(weeks=1)
+    else:
+        d = date(s.year, s.month, 1)
+        while d <= e:
+            result.append((d.strftime("%Y-%m"), d.strftime("%b '%y")))
+            nxt = d.month % 12 + 1
+            d   = date(d.year + (1 if d.month == 12 else 0), nxt, 1)
+    return result
 
 
 def _extract_lang_code(display_value: str) -> str:
@@ -273,6 +320,7 @@ class LanguageLoggerApp(tk.Tk):
         self.tmpl_inner = ttk.Frame(tmpl_lf)
         self.tmpl_inner.pack(fill=tk.BOTH, expand=True)
         self._refresh_templates()
+        self.bind("<Control-s>", lambda e: self.save_session())
 
     def _on_activity_type_change(self, event=None):
         activity = self.var_activity_type.get()
@@ -496,22 +544,7 @@ class LanguageLoggerApp(tk.Tk):
         self._sort_column  = "date"
         self._sort_reverse = True
 
-    def load_history(self):
-        # Refresh filter dropdown options from actual DB data
-        lang_codes = [r[0] for r in self.conn.execute(
-            "SELECT DISTINCT language FROM sessions WHERE language IS NOT NULL ORDER BY language"
-        ).fetchall()]
-        lang_opts = ["All"] + [
-            (f"{LANGUAGES[c]} ({c})" if c in LANGUAGES else c) for c in lang_codes
-        ]
-        self.cb_hist_lang["values"] = lang_opts
-
-        act_opts = ["All"] + [r[0] for r in self.conn.execute(
-            "SELECT DISTINCT activity_type FROM sessions ORDER BY activity_type"
-        ).fetchall()]
-        self.cb_hist_act["values"] = act_opts
-
-        # Build WHERE clause from active filters
+    def _history_where(self):
         conditions, params = [], []
         lang_sel = self.var_hist_lang.get()
         if lang_sel and lang_sel != "All":
@@ -530,6 +563,24 @@ class LanguageLoggerApp(tk.Tk):
             conditions.append("date <= ?")
             params.append(to_str)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        return where, params
+
+    def load_history(self):
+        # Refresh filter dropdown options from actual DB data
+        lang_codes = [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT language FROM sessions WHERE language IS NOT NULL ORDER BY language"
+        ).fetchall()]
+        lang_opts = ["All"] + [
+            (f"{LANGUAGES[c]} ({c})" if c in LANGUAGES else c) for c in lang_codes
+        ]
+        self.cb_hist_lang["values"] = lang_opts
+
+        act_opts = ["All"] + [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT activity_type FROM sessions ORDER BY activity_type"
+        ).fetchall()]
+        self.cb_hist_act["values"] = act_opts
+
+        where, params = self._history_where()
 
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -599,26 +650,7 @@ class LanguageLoggerApp(tk.Tk):
         if not path:
             return
 
-        # Reuse the same filter logic as load_history
-        conditions, params = [], []
-        lang_sel = self.var_hist_lang.get()
-        if lang_sel and lang_sel != "All":
-            conditions.append("language = ?")
-            params.append(_extract_lang_code(lang_sel))
-        act_sel = self.var_hist_act.get()
-        if act_sel and act_sel != "All":
-            conditions.append("activity_type = ?")
-            params.append(act_sel)
-        from_str = self.var_hist_from.get().strip()
-        to_str   = self.var_hist_to.get().strip()
-        if from_str:
-            conditions.append("date >= ?")
-            params.append(from_str)
-        if to_str:
-            conditions.append("date <= ?")
-            params.append(to_str)
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
+        where, params = self._history_where()
         rows = self.conn.execute(
             f"SELECT date, language, activity_type, specific_activity, duration_minutes, notes "
             f"FROM sessions {where} ORDER BY date DESC",
@@ -827,23 +859,12 @@ class LanguageLoggerApp(tk.Tk):
     def _apply_stats_preset(self, event=None):
         preset = self.var_stats_preset.get()
         today  = date.today()
-
-        def months_ago(n):
-            year, month = today.year, today.month - n
-            while month <= 0:
-                month += 12
-                year  -= 1
-            try:
-                return date(year, month, today.day)
-            except ValueError:
-                return date(year, month + 1, 1) - timedelta(days=1)
-
         starts = {
             "Last week":     today - timedelta(weeks=1),
-            "Last month":    months_ago(1),
-            "Last 3 months": months_ago(3),
-            "Last 6 months": months_ago(6),
-            "Last year":     months_ago(12),
+            "Last month":    _months_ago(1),
+            "Last 3 months": _months_ago(3),
+            "Last 6 months": _months_ago(6),
+            "Last year":     _months_ago(12),
         }
         start = starts.get(preset)
         if start:
@@ -901,46 +922,17 @@ class LanguageLoggerApp(tk.Tk):
         color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)]
                      for i, act in enumerate(all_acts)}
 
-        # ---- Period generation helpers ----
-        def period_key(d_str):
-            d = datetime.strptime(d_str, "%Y-%m-%d").date()
-            if grouping == "Day":
-                return d.isoformat()
-            if grouping == "Week":
-                return (d - timedelta(days=d.weekday())).isoformat()
-            return d_str[:7]  # Month
-
-        def all_periods(s, e):
-            result = []
-            if grouping == "Day":
-                d = s
-                while d <= e:
-                    result.append((d.isoformat(), d.strftime("%b %d")))
-                    d += timedelta(days=1)
-            elif grouping == "Week":
-                ws = s - timedelta(days=s.weekday())
-                while ws <= e:
-                    result.append((ws.isoformat(), ws.strftime("%b %d")))
-                    ws += timedelta(weeks=1)
-            else:
-                d = date(s.year, s.month, 1)
-                while d <= e:
-                    result.append((d.strftime("%Y-%m"), d.strftime("%b '%y")))
-                    nxt = d.month % 12 + 1
-                    d   = date(d.year + (1 if d.month == 12 else 0), nxt, 1)
-            return result
-
         data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
         eff_start  = start_date or min(data_dates)
         eff_end    = end_date   or max(data_dates)
-        periods    = all_periods(eff_start, eff_end)
+        periods    = _all_periods(eff_start, eff_end, grouping)
         p_keys     = [p[0] for p in periods]
         p_labels   = [p[1] for p in periods]
 
         # ---- Accumulate hours by (activity, period) ----
         by_act_period = defaultdict(lambda: defaultdict(float))
         for d_str, act, dur in rows:
-            by_act_period[act][period_key(d_str)] += dur / 60
+            by_act_period[act][_period_key(d_str, grouping)] += dur / 60
 
         # ---- Stacked bar chart ----
         x       = list(range(len(p_keys)))
@@ -1054,23 +1046,12 @@ class LanguageLoggerApp(tk.Tk):
     def _apply_cumulative_preset(self, event=None):
         preset = self.var_cumul_preset.get()
         today  = date.today()
-
-        def months_ago(n):
-            year, month = today.year, today.month - n
-            while month <= 0:
-                month += 12
-                year  -= 1
-            try:
-                return date(year, month, today.day)
-            except ValueError:
-                return date(year, month + 1, 1) - timedelta(days=1)
-
         starts = {
             "Last week":     today - timedelta(weeks=1),
-            "Last month":    months_ago(1),
-            "Last 3 months": months_ago(3),
-            "Last 6 months": months_ago(6),
-            "Last year":     months_ago(12),
+            "Last month":    _months_ago(1),
+            "Last 3 months": _months_ago(3),
+            "Last 6 months": _months_ago(6),
+            "Last year":     _months_ago(12),
         }
         start = starts.get(preset)
         if start:
@@ -1142,44 +1123,17 @@ class LanguageLoggerApp(tk.Tk):
         color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)]
                      for i, act in enumerate(all_acts)}
 
-        # ---- Period helpers ----
-        def period_key(d_str):
-            d = datetime.strptime(d_str, "%Y-%m-%d").date()
-            if grouping == "Day":   return d.isoformat()
-            if grouping == "Week":  return (d - timedelta(days=d.weekday())).isoformat()
-            return d_str[:7]
-
-        def all_periods(s, e):
-            result = []
-            if grouping == "Day":
-                d = s
-                while d <= e:
-                    result.append((d.isoformat(), d.strftime("%b %d")))
-                    d += timedelta(days=1)
-            elif grouping == "Week":
-                ws = s - timedelta(days=s.weekday())
-                while ws <= e:
-                    result.append((ws.isoformat(), ws.strftime("%b %d")))
-                    ws += timedelta(weeks=1)
-            else:
-                d = date(s.year, s.month, 1)
-                while d <= e:
-                    result.append((d.strftime("%Y-%m"), d.strftime("%b '%y")))
-                    nxt = d.month % 12 + 1
-                    d   = date(d.year + (1 if d.month == 12 else 0), nxt, 1)
-            return result
-
         data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
         eff_start  = start_date or min(data_dates)
         eff_end    = end_date   or max(data_dates)
-        periods    = all_periods(eff_start, eff_end)
+        periods    = _all_periods(eff_start, eff_end, grouping)
         p_keys     = [p[0] for p in periods]
         p_labels   = [p[1] for p in periods]
 
         # ---- Accumulate per (activity, period) ----
         by_act_period = defaultdict(lambda: defaultdict(float))
         for d_str, act, dur in rows:
-            by_act_period[act][period_key(d_str)] += dur / 60
+            by_act_period[act][_period_key(d_str, grouping)] += dur / 60
 
         # ---- Build cumulative series per activity ----
         cumul = {act: [] for act in all_acts}
