@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.ticker import FuncFormatter
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
 
@@ -44,6 +45,16 @@ ACTIVITIES = {
     "Grammar":    ["Textbook", "Exercises", "Online Course", "Other"],
     "Watching":   ["Movie", "TV Series", "YouTube", "Other"],
 }
+
+
+def _fmt_time(total_minutes: float) -> str:
+    """Convert a minute total to dd:hh:mm (days omitted when zero)."""
+    m = int(round(total_minutes))
+    d, rem = divmod(m, 1440)
+    h, mn  = divmod(rem, 60)
+    if d > 0:
+        return f"{d:02d}:{h:02d}:{mn:02d}"
+    return f"{h:02d}:{mn:02d}"
 
 
 _CHART_COLORS = [
@@ -396,33 +407,44 @@ class LanguageLoggerApp(tk.Tk):
         filter_frame = ttk.Frame(frame)
         filter_frame.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
 
+        _lang_w = max(len(o) for o in LANGUAGE_OPTIONS)
         ttk.Label(filter_frame, text="Language:").pack(side=tk.LEFT)
         self.var_stats_lang = tk.StringVar(value="All")
         self.cb_stats_lang = ttk.Combobox(
             filter_frame, textvariable=self.var_stats_lang,
-            values=["All"] + self._pref_languages(), width=22, state="readonly",
+            values=["All"] + self._pref_languages(), width=_lang_w, state="readonly",
         )
-        self.cb_stats_lang.pack(side=tk.LEFT, padx=(4, 16))
+        self.cb_stats_lang.pack(side=tk.LEFT, padx=(4, 10))
 
         eight_ago = (date.today() - timedelta(weeks=8)).isoformat()
         ttk.Label(filter_frame, text="From:").pack(side=tk.LEFT)
         self.var_stats_start = tk.StringVar(value=eight_ago)
-        ttk.Entry(filter_frame, textvariable=self.var_stats_start, width=12).pack(
-            side=tk.LEFT, padx=(4, 16)
+        ttk.Entry(filter_frame, textvariable=self.var_stats_start, width=11).pack(
+            side=tk.LEFT, padx=(4, 10)
         )
 
         ttk.Label(filter_frame, text="To:").pack(side=tk.LEFT)
         self.var_stats_end = tk.StringVar(value=date.today().isoformat())
-        ttk.Entry(filter_frame, textvariable=self.var_stats_end, width=12).pack(
-            side=tk.LEFT, padx=(4, 16)
+        ttk.Entry(filter_frame, textvariable=self.var_stats_end, width=11).pack(
+            side=tk.LEFT, padx=(4, 10)
         )
 
-        ttk.Label(filter_frame, text="Group by:").pack(side=tk.LEFT)
+        ttk.Label(filter_frame, text="By:").pack(side=tk.LEFT)
         self.var_stats_groupby = tk.StringVar(value="Week")
         ttk.Combobox(
             filter_frame, textvariable=self.var_stats_groupby,
-            values=["Day", "Week", "Month"], width=8, state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 16))
+            values=["Day", "Week", "Month"], width=6, state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Label(filter_frame, text="Quick:").pack(side=tk.LEFT)
+        self.var_stats_preset = tk.StringVar()
+        cb_preset = ttk.Combobox(
+            filter_frame, textvariable=self.var_stats_preset,
+            values=["Last week", "Last month", "Last 3 months", "Last 6 months", "Last year"],
+            width=13, state="readonly",
+        )
+        cb_preset.pack(side=tk.LEFT, padx=(4, 10))
+        cb_preset.bind("<<ComboboxSelected>>", self._apply_stats_preset)
 
         ttk.Button(filter_frame, text="Refresh", command=self.refresh_stats).pack(side=tk.LEFT)
 
@@ -436,6 +458,33 @@ class LanguageLoggerApp(tk.Tk):
         toolbar_frame = ttk.Frame(frame)
         toolbar_frame.grid(row=2, column=0, sticky=tk.EW)
         NavigationToolbar2Tk(self.canvas, toolbar_frame)
+
+    def _apply_stats_preset(self, event=None):
+        preset = self.var_stats_preset.get()
+        today  = date.today()
+
+        def months_ago(n):
+            year, month = today.year, today.month - n
+            while month <= 0:
+                month += 12
+                year  -= 1
+            try:
+                return date(year, month, today.day)
+            except ValueError:
+                return date(year, month + 1, 1) - timedelta(days=1)
+
+        starts = {
+            "Last week":     today - timedelta(weeks=1),
+            "Last month":    months_ago(1),
+            "Last 3 months": months_ago(3),
+            "Last 6 months": months_ago(6),
+            "Last year":     months_ago(12),
+        }
+        start = starts.get(preset)
+        if start:
+            self.var_stats_start.set(start.isoformat())
+            self.var_stats_end.set(today.isoformat())
+            self.refresh_stats()
 
     def refresh_stats(self):
         from collections import defaultdict
@@ -539,8 +588,9 @@ class LanguageLoggerApp(tk.Tk):
         ax_bar.set_xticks(x)
         label_fs = max(5, min(8, 80 // max(len(p_keys), 1)))
         ax_bar.set_xticklabels(p_labels, rotation=40, ha="right", fontsize=label_fs)
-        ax_bar.set_ylabel("Hours")
-        bar_title = f"Hours per {grouping}"
+        ax_bar.yaxis.set_major_formatter(FuncFormatter(lambda h, _: _fmt_time(h * 60)))
+        ax_bar.set_ylabel("Duration")
+        bar_title = f"Time per {grouping}"
         if lang_display != "All":
             bar_title += f"\n({lang_display})"
         ax_bar.set_title(bar_title, fontsize=9)
@@ -556,13 +606,14 @@ class LanguageLoggerApp(tk.Tk):
         pie_colors = [color_map[l] for l in pie_labels]
 
         def _autopct(pct):
-            h = pct * total_min / 100 / 60
-            return f"{pct:.1f}%\n{h:.1f}h"
+            mins = pct * total_min / 100
+            return f"{pct:.1f}%\n{_fmt_time(mins)}"
 
         ax_pie.pie(sizes, labels=pie_labels, colors=pie_colors,
                    autopct=_autopct, startangle=140, textprops={"fontsize": 7})
-        total_h = round(total_min / 60, 1)
-        ax_pie.set_title(f"Activity Breakdown  ·  Total: {total_h}h", fontsize=9)
+        ax_pie.set_title(
+            f"Activity Breakdown  ·  Total: {_fmt_time(total_min)}", fontsize=9
+        )
 
         self.canvas.draw()
 
