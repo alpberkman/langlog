@@ -1193,17 +1193,35 @@ class SettingsTab(ttk.Frame):
         sub = ttk.Notebook(self)
         sub.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
 
-        st_lang = ttk.Frame(sub)
-        st_act  = ttk.Frame(sub)
-        st_spec = ttk.Frame(sub)
+        st_lang  = ttk.Frame(sub)
+        st_act   = ttk.Frame(sub)
+        st_spec  = ttk.Frame(sub)
+        st_theme = ttk.Frame(sub)
 
-        sub.add(st_lang, text="  Languages  ")
-        sub.add(st_act,  text="  Activity Types  ")
-        sub.add(st_spec, text="  Specific Activities  ")
+        sub.add(st_lang,  text="  Languages  ")
+        sub.add(st_act,   text="  Activity Types  ")
+        sub.add(st_spec,  text="  Specific Activities  ")
+        sub.add(st_theme, text="  Theme  ")
 
         self._build_lang_tab(st_lang)
         self._build_activity_tab(st_act)
         self._build_specific_tab(st_spec)
+        self._build_theme_tab(st_theme)
+
+    def _build_theme_tab(self, parent):
+        style   = ttk.Style()
+        themes  = sorted(style.theme_names())
+        current = style.theme_use()
+
+        ttk.Label(parent, text="Application theme:").grid(row=0, column=0, padx=12, pady=(16, 4), sticky=tk.W)
+        self.var_theme = tk.StringVar(value=current)
+        cb = ttk.Combobox(parent, textvariable=self.var_theme, values=themes,
+                          state="readonly", width=20)
+        cb.grid(row=1, column=0, padx=12, sticky=tk.W)
+        cb.bind("<<ComboboxSelected>>", self._apply_theme)
+
+    def _apply_theme(self, event=None):
+        ttk.Style().theme_use(self.var_theme.get())
 
     def _save_all(self):
         self._save_lang()
