@@ -4,6 +4,7 @@ import sqlite3
 import csv
 import os
 import sys
+from collections import defaultdict
 from datetime import date, timedelta, datetime
 import matplotlib
 matplotlib.use("TkAgg")
@@ -52,9 +53,13 @@ ACTIVITIES = {
     "Watching":   ["Movie", "TV Series", "YouTube", "Other"],
 }
 
+_CHART_COLORS = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
+    "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
+]
+
 
 def _fmt_time(total_minutes: float) -> str:
-    """Convert a minute total to dd:hh:mm (days omitted when zero)."""
     m = int(round(total_minutes))
     d, rem = divmod(m, 1440)
     h, mn  = divmod(rem, 60)
@@ -63,18 +68,12 @@ def _fmt_time(total_minutes: float) -> str:
     return f"{h:02d}:{mn:02d}"
 
 
-_CHART_COLORS = [
-    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
-    "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
-]
-
-
-def _months_ago(n: int) -> "date":
+def _months_ago(n: int) -> date:
     today = date.today()
     year, month = today.year, today.month - n
     while month <= 0:
         month += 12
-        year -= 1
+        year  -= 1
     try:
         return date(year, month, today.day)
     except ValueError:
@@ -90,7 +89,7 @@ def _period_key(d_str: str, grouping: str) -> str:
     return d_str[:7]
 
 
-def _all_periods(s: "date", e: "date", grouping: str):
+def _all_periods(s: date, e: date, grouping: str) -> list:
     result = []
     if grouping == "Day":
         d = s
@@ -117,21 +116,35 @@ def _extract_lang_code(display_value: str) -> str:
     return display_value.strip()
 
 
-class LanguageLoggerApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Language Learning Logger")
-        self.geometry("920x620")
-        self.minsize(740, 520)
-        self._init_db()
-        self._build_ui()
+def _prepare_chart_data(rows, start_date, end_date, grouping):
+    """Shared computation for Stats and Cumulative charts. Returns None when rows is empty."""
+    if not rows:
+        return None
+    all_acts  = sorted(set(act for _, act, _ in rows))
+    color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)] for i, act in enumerate(all_acts)}
+    data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
+    eff_start  = start_date or min(data_dates)
+    eff_end    = end_date   or max(data_dates)
+    periods    = _all_periods(eff_start, eff_end, grouping)
+    p_keys     = [p[0] for p in periods]
+    p_labels   = [p[1] for p in periods]
+    by_act_period = defaultdict(lambda: defaultdict(float))
+    for d_str, act, dur in rows:
+        by_act_period[act][_period_key(d_str, grouping)] += dur / 60
+    return all_acts, color_map, p_keys, p_labels, by_act_period
 
-    # ------------------------------------------------------------------
-    # Database
-    # ------------------------------------------------------------------
 
-    def _init_db(self):
-        self.conn = sqlite3.connect(DB_PATH)
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+class Database:
+    def __init__(self, path: str):
+        self.conn = sqlite3.connect(path)
+        self._init_schema()
+        self._seed_prefs()
+
+    def _init_schema(self):
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,7 +181,6 @@ class LanguageLoggerApp(tk.Tk):
             );
         """)
         self.conn.commit()
-        self._seed_prefs()
 
     def _seed_prefs(self):
         if self.conn.execute("SELECT COUNT(*) FROM pref_languages").fetchone()[0] == 0:
@@ -182,83 +194,284 @@ class LanguageLoggerApp(tk.Tk):
                 [(name,) for name in ACTIVITIES],
             )
         if self.conn.execute("SELECT COUNT(*) FROM pref_specific_activities").fetchone()[0] == 0:
-            rows = [
-                (act, spec, 1, 0)
-                for act, specs in ACTIVITIES.items()
-                for spec in specs
-            ]
             self.conn.executemany(
                 "INSERT OR IGNORE INTO pref_specific_activities VALUES (?, ?, ?, ?)",
-                rows,
+                [(act, spec, 1, 0) for act, specs in ACTIVITIES.items() for spec in specs],
             )
         self.conn.commit()
 
-    # -- preference readers --
+    # ---------- preference readers ----------
 
-    def _pref_languages(self):
-        """Display strings for enabled languages; falls back to all if none enabled."""
-        enabled = {r[0] for r in self.conn.execute(
-            "SELECT code FROM pref_languages WHERE enabled=1"
-        )}
+    def pref_languages(self) -> list:
+        enabled = {r[0] for r in self.conn.execute("SELECT code FROM pref_languages WHERE enabled=1")}
         if not enabled:
             return LANGUAGE_OPTIONS
         return [o for o in LANGUAGE_OPTIONS if _extract_lang_code(o) in enabled]
 
-    def _pref_activity_types(self):
+    def pref_activity_types(self) -> list:
         return [r[0] for r in self.conn.execute(
             "SELECT name FROM pref_activity_types WHERE enabled=1"
         )]
 
-    def _pref_specifics(self, activity_type: str):
+    def pref_specifics(self, activity_type: str) -> list:
         return [r[0] for r in self.conn.execute(
             "SELECT name FROM pref_specific_activities "
             "WHERE activity_type=? AND enabled=1 ORDER BY is_custom, name",
             (activity_type,),
         )]
 
-    # ------------------------------------------------------------------
-    # UI skeleton
-    # ------------------------------------------------------------------
+    def enabled_lang_codes(self) -> set:
+        return {r[0] for r in self.conn.execute("SELECT code FROM pref_languages WHERE enabled=1")}
 
-    def _build_ui(self):
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+    def enabled_activity_names(self) -> set:
+        return {r[0] for r in self.conn.execute("SELECT name FROM pref_activity_types WHERE enabled=1")}
 
-        self.tab_log        = ttk.Frame(self.notebook)
-        self.tab_history    = ttk.Frame(self.notebook)
-        self.tab_stats      = ttk.Frame(self.notebook)
-        self.tab_cumulative = ttk.Frame(self.notebook)
-        self.tab_settings   = ttk.Frame(self.notebook)
+    def load_spec_state(self) -> dict:
+        result = {}
+        for act_type in ACTIVITIES:
+            rows = self.conn.execute(
+                "SELECT name, is_custom, enabled FROM pref_specific_activities "
+                "WHERE activity_type=? ORDER BY is_custom, name",
+                (act_type,),
+            ).fetchall()
+            result[act_type] = {
+                "items":    [(r[0], bool(r[1])) for r in rows],
+                "selected": {r[0] for r in rows if r[2]},
+            }
+        return result
 
-        self.notebook.add(self.tab_log,        text="  Log Session  ")
-        self.notebook.add(self.tab_history,    text="  History  ")
-        self.notebook.add(self.tab_stats,      text="  Stats  ")
-        self.notebook.add(self.tab_cumulative, text="  Cumulative  ")
-        self.notebook.add(self.tab_settings,   text="  Settings  ")
+    # ---------- sessions ----------
 
-        self._build_log_tab()
-        self._build_history_tab()
-        self._build_stats_tab()
-        self._build_cumulative_tab()
-        self._build_settings_tab()
+    def _build_where(self, lang_code=None, activity=None, start=None, end=None):
+        conditions, params = [], []
+        if lang_code:
+            conditions.append("language = ?")
+            params.append(lang_code)
+        if activity:
+            conditions.append("activity_type = ?")
+            params.append(activity)
+        if start:
+            conditions.append("date >= ?")
+            params.append(start)
+        if end:
+            conditions.append("date <= ?")
+            params.append(end)
+        return ("WHERE " + " AND ".join(conditions)) if conditions else "", params
 
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
+    def get_sessions(self, lang_code=None, activity=None, start=None, end=None) -> list:
+        where, params = self._build_where(lang_code, activity, start, end)
+        return self.conn.execute(
+            f"SELECT id, date, language, activity_type, specific_activity, duration_minutes, notes "
+            f"FROM sessions {where} ORDER BY date DESC",
+            params,
+        ).fetchall()
 
-    def _on_tab_change(self, event):
-        tab = self.notebook.index(self.notebook.select())
-        if tab == 1:
-            self.load_history()
-        elif tab == 2:
-            self.refresh_stats()
-        elif tab == 3:
-            self.refresh_cumulative()
+    def get_chart_rows(self, lang_code=None, start=None, end=None) -> list:
+        where, params = self._build_where(lang_code, start=start, end=end)
+        return self.conn.execute(
+            f"SELECT date, activity_type, duration_minutes FROM sessions {where}", params
+        ).fetchall()
 
-    # ------------------------------------------------------------------
-    # Tab 1 — Log Session
-    # ------------------------------------------------------------------
+    def get_session(self, session_id: int) -> tuple:
+        return self.conn.execute(
+            "SELECT language, activity_type, specific_activity, duration_minutes, date, notes "
+            "FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
 
-    def _build_log_tab(self):
-        frame = ttk.Frame(self.tab_log, padding=20)
+    def insert_session(self, language, activity_type, specific, duration, date_str, notes):
+        self.conn.execute(
+            "INSERT INTO sessions "
+            "(language, activity_type, specific_activity, duration_minutes, date, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (language, activity_type, specific, duration, date_str, notes),
+        )
+        self.conn.commit()
+
+    def update_session(self, session_id, language, activity_type, specific, duration, date_str, notes):
+        self.conn.execute(
+            "UPDATE sessions SET language=?, activity_type=?, specific_activity=?, "
+            "duration_minutes=?, date=?, notes=? WHERE id=?",
+            (language, activity_type, specific, duration, date_str, notes, session_id),
+        )
+        self.conn.commit()
+
+    def delete_session(self, session_id: int):
+        self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self.conn.commit()
+
+    def distinct_languages(self) -> list:
+        return [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT language FROM sessions WHERE language IS NOT NULL ORDER BY language"
+        ).fetchall()]
+
+    def distinct_activities(self) -> list:
+        return [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT activity_type FROM sessions ORDER BY activity_type"
+        ).fetchall()]
+
+    # ---------- templates ----------
+
+    def get_templates(self) -> list:
+        return self.conn.execute("SELECT id, name FROM templates ORDER BY name").fetchall()
+
+    def get_template(self, template_id: int) -> tuple:
+        return self.conn.execute(
+            "SELECT language, activity_type, specific_activity, duration_minutes, notes "
+            "FROM templates WHERE id=?", (template_id,)
+        ).fetchone()
+
+    def insert_template(self, name, language, activity_type, specific, duration, notes):
+        self.conn.execute(
+            "INSERT INTO templates "
+            "(name, language, activity_type, specific_activity, duration_minutes, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (name, language, activity_type, specific, duration, notes),
+        )
+        self.conn.commit()
+
+    def delete_template(self, template_id: int):
+        self.conn.execute("DELETE FROM templates WHERE id=?", (template_id,))
+        self.conn.commit()
+
+    # ---------- preference saves ----------
+
+    def save_lang_prefs(self, selected_codes: set):
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO pref_languages (code, enabled) VALUES (?, ?)",
+            [(code, 1 if code in selected_codes else 0) for code in LANGUAGES],
+        )
+        self.conn.commit()
+
+    def save_activity_prefs(self, enabled_map: dict):
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO pref_activity_types (name, enabled) VALUES (?, ?)",
+            [(name, 1 if enabled else 0) for name, enabled in enabled_map.items()],
+        )
+        self.conn.commit()
+
+    def save_specific_prefs(self, spec_state: dict):
+        for act_type, state in spec_state.items():
+            existing = {r[0] for r in self.conn.execute(
+                "SELECT name FROM pref_specific_activities WHERE activity_type=?", (act_type,)
+            )}
+            current = {item[0] for item in state["items"]}
+            for name in existing - current:
+                self.conn.execute(
+                    "DELETE FROM pref_specific_activities WHERE activity_type=? AND name=?",
+                    (act_type, name),
+                )
+            for name, is_custom in state["items"]:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO pref_specific_activities "
+                    "(activity_type, name, enabled, is_custom) VALUES (?, ?, ?, ?)",
+                    (act_type, name, 1 if name in state["selected"] else 0, 1 if is_custom else 0),
+                )
+        self.conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# FilterBar — shared widget for Stats and Cumulative tabs
+# ---------------------------------------------------------------------------
+
+class FilterBar(ttk.Frame):
+    def __init__(self, parent, db: Database, on_refresh):
+        super().__init__(parent)
+        self.db         = db
+        self._on_refresh = on_refresh
+        self._build()
+
+    def _build(self):
+        _lang_w = max(len(o) for o in LANGUAGE_OPTIONS)
+
+        ttk.Label(self, text="Language:").pack(side=tk.LEFT)
+        self.var_lang = tk.StringVar(value="All")
+        self.cb_lang = ttk.Combobox(
+            self, textvariable=self.var_lang,
+            values=["All"] + self.db.pref_languages(), width=_lang_w, state="readonly",
+        )
+        self.cb_lang.pack(side=tk.LEFT, padx=(4, 10))
+
+        eight_ago = (date.today() - timedelta(weeks=8)).isoformat()
+        ttk.Label(self, text="From:").pack(side=tk.LEFT)
+        self.var_start = tk.StringVar(value=eight_ago)
+        ttk.Entry(self, textvariable=self.var_start, width=11).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Label(self, text="To:").pack(side=tk.LEFT)
+        self.var_end = tk.StringVar(value=date.today().isoformat())
+        ttk.Entry(self, textvariable=self.var_end, width=11).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Label(self, text="By:").pack(side=tk.LEFT)
+        self.var_groupby = tk.StringVar(value="Week")
+        ttk.Combobox(
+            self, textvariable=self.var_groupby,
+            values=["Day", "Week", "Month"], width=6, state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Label(self, text="Quick:").pack(side=tk.LEFT)
+        self.var_preset = tk.StringVar()
+        cb_preset = ttk.Combobox(
+            self, textvariable=self.var_preset,
+            values=["Last week", "Last month", "Last 3 months", "Last 6 months", "Last year"],
+            width=13, state="readonly",
+        )
+        cb_preset.pack(side=tk.LEFT, padx=(4, 10))
+        cb_preset.bind("<<ComboboxSelected>>", self._apply_preset)
+
+        ttk.Button(self, text="Refresh", command=self._on_refresh).pack(side=tk.LEFT)
+
+    def _apply_preset(self, event=None):
+        preset = self.var_preset.get()
+        today  = date.today()
+        starts = {
+            "Last week":     today - timedelta(weeks=1),
+            "Last month":    _months_ago(1),
+            "Last 3 months": _months_ago(3),
+            "Last 6 months": _months_ago(6),
+            "Last year":     _months_ago(12),
+        }
+        start = starts.get(preset)
+        if start:
+            self.var_start.set(start.isoformat())
+            self.var_end.set(today.isoformat())
+            self._on_refresh()
+
+    def refresh_lang_options(self):
+        self.cb_lang["values"] = ["All"] + self.db.pref_languages()
+
+    @property
+    def lang_code(self):
+        v = self.var_lang.get()
+        return None if v == "All" else _extract_lang_code(v)
+
+    @property
+    def lang_display(self):
+        return self.var_lang.get()
+
+    @property
+    def start_str(self):
+        return self.var_start.get().strip()
+
+    @property
+    def end_str(self):
+        return self.var_end.get().strip()
+
+    @property
+    def grouping(self):
+        return self.var_groupby.get()
+
+
+# ---------------------------------------------------------------------------
+# Tab 1 — Log Session
+# ---------------------------------------------------------------------------
+
+class LogTab(ttk.Frame):
+    def __init__(self, parent, db: Database):
+        super().__init__(parent)
+        self.db = db
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(1, weight=1)
 
@@ -268,7 +481,7 @@ class LanguageLoggerApp(tk.Tk):
         lbl("Language:", 0)
         self.var_language = tk.StringVar()
         self.cb_language = ttk.Combobox(frame, textvariable=self.var_language, width=30)
-        self.cb_language["values"] = self._pref_languages()
+        self.cb_language["values"] = self.db.pref_languages()
         self.cb_language.grid(row=0, column=1, sticky=tk.EW)
         ttk.Label(frame, text="e.g. Japanese (ja)", foreground="gray").grid(
             row=0, column=2, sticky=tk.W, padx=(6, 0)
@@ -278,7 +491,7 @@ class LanguageLoggerApp(tk.Tk):
         self.var_activity_type = tk.StringVar()
         self.cb_activity_type = ttk.Combobox(
             frame, textvariable=self.var_activity_type,
-            values=self._pref_activity_types(), state="readonly", width=30,
+            values=self.db.pref_activity_types(), state="readonly", width=30,
         )
         self.cb_activity_type.grid(row=1, column=1, sticky=tk.EW)
         self.cb_activity_type.bind("<<ComboboxSelected>>", self._on_activity_type_change)
@@ -320,29 +533,23 @@ class LanguageLoggerApp(tk.Tk):
         self.tmpl_inner = ttk.Frame(tmpl_lf)
         self.tmpl_inner.pack(fill=tk.BOTH, expand=True)
         self._refresh_templates()
-        self.bind("<Control-s>", lambda e: self.save_session())
 
     def _on_activity_type_change(self, event=None):
-        activity = self.var_activity_type.get()
-        specifics = self._pref_specifics(activity)
+        activity  = self.var_activity_type.get()
+        specifics = self.db.pref_specifics(activity)
         self.cb_specific["values"] = specifics
         self.var_specific.set(specifics[0] if specifics else "")
 
-    def _refresh_log_form(self):
-        self.cb_language["values"] = self._pref_languages()
-        self.cb_activity_type["values"] = self._pref_activity_types()
+    def refresh_prefs(self):
+        self.cb_language["values"]     = self.db.pref_languages()
+        self.cb_activity_type["values"] = self.db.pref_activity_types()
         act = self.var_activity_type.get()
         if act:
-            specs = self._pref_specifics(act)
-            self.cb_specific["values"] = specs
-        if hasattr(self, "cb_stats_lang"):
-            self.cb_stats_lang["values"] = ["All"] + self._pref_languages()
-        if hasattr(self, "cb_cumul_lang"):
-            self.cb_cumul_lang["values"] = ["All"] + self._pref_languages()
+            self.cb_specific["values"] = self.db.pref_specifics(act)
 
     def save_session(self):
-        lang_display = self.var_language.get().strip()
-        language     = _extract_lang_code(lang_display) if lang_display else None
+        lang_display  = self.var_language.get().strip()
+        language      = _extract_lang_code(lang_display) if lang_display else None
         activity_type = self.var_activity_type.get().strip()
         specific      = self.var_specific.get().strip() or None
         notes         = self.txt_notes.get("1.0", tk.END).strip() or None
@@ -366,14 +573,7 @@ class LanguageLoggerApp(tk.Tk):
             messagebox.showerror("Validation Error", "Activity Type is required.")
             return
 
-        self.conn.execute(
-            "INSERT INTO sessions "
-            "(language, activity_type, specific_activity, duration_minutes, date, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (language, activity_type, specific, duration, date_str, notes),
-        )
-        self.conn.commit()
-
+        self.db.insert_session(language, activity_type, specific, duration, date_str, notes)
         self.var_activity_type.set("")
         self.var_specific.set("")
         self.cb_specific["values"] = []
@@ -402,22 +602,13 @@ class LanguageLoggerApp(tk.Tk):
             duration = 30
 
         try:
-            self.conn.execute(
-                "INSERT INTO templates "
-                "(name, language, activity_type, specific_activity, duration_minutes, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (name, language, activity_type, specific, duration, notes),
-            )
-            self.conn.commit()
+            self.db.insert_template(name, language, activity_type, specific, duration, notes)
             self._refresh_templates()
         except sqlite3.IntegrityError:
             messagebox.showerror("Duplicate Name", f'A template named "{name}" already exists.')
 
     def _apply_template(self, tid):
-        row = self.conn.execute(
-            "SELECT language, activity_type, specific_activity, duration_minutes, notes "
-            "FROM templates WHERE id=?", (tid,)
-        ).fetchone()
+        row = self.db.get_template(tid)
         if not row:
             return
         lang, act, spec, dur, notes = row
@@ -437,81 +628,83 @@ class LanguageLoggerApp(tk.Tk):
 
     def _delete_template(self, tid):
         if messagebox.askyesno("Delete Template", "Delete this template?"):
-            self.conn.execute("DELETE FROM templates WHERE id=?", (tid,))
-            self.conn.commit()
+            self.db.delete_template(tid)
             self._refresh_templates()
 
     def _refresh_templates(self):
         for w in self.tmpl_inner.winfo_children():
             w.destroy()
-        rows = self.conn.execute(
-            "SELECT id, name FROM templates ORDER BY name"
-        ).fetchall()
+        rows = self.db.get_templates()
         if not rows:
-            ttk.Label(
-                self.tmpl_inner, text="No templates saved yet.", foreground="gray"
-            ).pack(anchor=tk.W, padx=2, pady=2)
+            ttk.Label(self.tmpl_inner, text="No templates saved yet.", foreground="gray").pack(
+                anchor=tk.W, padx=2, pady=2
+            )
             return
         for tid, tname in rows:
             row_f = ttk.Frame(self.tmpl_inner)
             row_f.pack(fill=tk.X, pady=1)
             row_f.columnconfigure(0, weight=1)
-            ttk.Button(
-                row_f, text=tname,
-                command=lambda t=tid: self._apply_template(t),
-            ).grid(row=0, column=0, sticky=tk.EW, padx=(0, 4))
-            ttk.Button(
-                row_f, text="×", width=2,
-                command=lambda t=tid: self._delete_template(t),
-            ).grid(row=0, column=1)
+            ttk.Button(row_f, text=tname, command=lambda t=tid: self._apply_template(t)).grid(
+                row=0, column=0, sticky=tk.EW, padx=(0, 4)
+            )
+            ttk.Button(row_f, text="×", width=2, command=lambda t=tid: self._delete_template(t)).grid(
+                row=0, column=1
+            )
 
-    # ------------------------------------------------------------------
-    # Tab 2 — History
-    # ------------------------------------------------------------------
 
-    def _build_history_tab(self):
-        frame = ttk.Frame(self.tab_history, padding=10)
+# ---------------------------------------------------------------------------
+# Tab 2 — History
+# ---------------------------------------------------------------------------
+
+class HistoryTab(ttk.Frame):
+    def __init__(self, parent, db: Database):
+        super().__init__(parent)
+        self.db            = db
+        self._tree_id_map  = {}
+        self._sort_column  = "date"
+        self._sort_reverse = True
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
 
-        # Filter bar (row 0)
+        # Filter bar
         fbar = ttk.Frame(frame)
         fbar.grid(row=0, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
 
         ttk.Label(fbar, text="Language:").pack(side=tk.LEFT)
-        self.var_hist_lang = tk.StringVar(value="All")
-        self.cb_hist_lang = ttk.Combobox(
-            fbar, textvariable=self.var_hist_lang, values=["All"],
-            width=20, state="readonly",
+        self.var_lang = tk.StringVar(value="All")
+        self.cb_lang = ttk.Combobox(
+            fbar, textvariable=self.var_lang, values=["All"], width=20, state="readonly"
         )
-        self.cb_hist_lang.pack(side=tk.LEFT, padx=(4, 12))
-        self.cb_hist_lang.bind("<<ComboboxSelected>>", lambda e: self.load_history())
+        self.cb_lang.pack(side=tk.LEFT, padx=(4, 12))
+        self.cb_lang.bind("<<ComboboxSelected>>", lambda e: self.refresh())
 
         ttk.Label(fbar, text="Activity:").pack(side=tk.LEFT)
-        self.var_hist_act = tk.StringVar(value="All")
-        self.cb_hist_act = ttk.Combobox(
-            fbar, textvariable=self.var_hist_act, values=["All"],
-            width=14, state="readonly",
+        self.var_act = tk.StringVar(value="All")
+        self.cb_act = ttk.Combobox(
+            fbar, textvariable=self.var_act, values=["All"], width=14, state="readonly"
         )
-        self.cb_hist_act.pack(side=tk.LEFT, padx=(4, 12))
-        self.cb_hist_act.bind("<<ComboboxSelected>>", lambda e: self.load_history())
+        self.cb_act.pack(side=tk.LEFT, padx=(4, 12))
+        self.cb_act.bind("<<ComboboxSelected>>", lambda e: self.refresh())
 
         ttk.Label(fbar, text="From:").pack(side=tk.LEFT)
-        self.var_hist_from = tk.StringVar()
-        ttk.Entry(fbar, textvariable=self.var_hist_from, width=11).pack(side=tk.LEFT, padx=(4, 6))
+        self.var_from = tk.StringVar()
+        ttk.Entry(fbar, textvariable=self.var_from, width=11).pack(side=tk.LEFT, padx=(4, 6))
 
         ttk.Label(fbar, text="To:").pack(side=tk.LEFT)
-        self.var_hist_to = tk.StringVar()
-        ttk.Entry(fbar, textvariable=self.var_hist_to, width=11).pack(side=tk.LEFT, padx=(4, 10))
+        self.var_to = tk.StringVar()
+        ttk.Entry(fbar, textvariable=self.var_to, width=11).pack(side=tk.LEFT, padx=(4, 10))
 
-        ttk.Button(fbar, text="Apply", command=self.load_history).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(fbar, text="Clear", command=self._clear_history_filter).pack(side=tk.LEFT)
+        ttk.Button(fbar, text="Apply", command=self.refresh).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(fbar, text="Clear", command=self._clear_filter).pack(side=tk.LEFT)
 
-        # Treeview (row 1)
+        # Treeview
         columns = ("date", "language", "activity", "specific", "duration", "notes")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
-
         col_cfg = [
             ("date",     "Date",              100),
             ("language", "Language",          140),
@@ -521,89 +714,57 @@ class LanguageLoggerApp(tk.Tk):
             ("notes",    "Notes",             200),
         ]
         for col_id, heading, width in col_cfg:
-            self.tree.heading(col_id, text=heading,
-                              command=lambda c=col_id: self._sort_tree(c))
+            self.tree.heading(col_id, text=heading, command=lambda c=col_id: self._sort(c))
             self.tree.column(col_id, width=width, anchor=tk.W)
 
         vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL,   command=self.tree.yview)
         hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
         self.tree.grid(row=1, column=0, sticky=tk.NSEW)
         vsb.grid(row=1, column=1, sticky=tk.NS)
         hsb.grid(row=2, column=0, sticky=tk.EW)
-
-        self.tree.bind("<Double-1>", self._on_history_double_click)
+        self.tree.bind("<Double-1>", self._on_double_click)
 
         btn_row = ttk.Frame(frame)
         btn_row.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
-        ttk.Button(btn_row, text="Delete Selected", command=self.delete_session).pack(side=tk.LEFT)
-        ttk.Button(btn_row, text="Export as CSV", command=self._export_csv).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Delete Selected", command=self._delete_selected).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Export as CSV",   command=self._export_csv).pack(side=tk.RIGHT)
 
-        self._tree_id_map  = {}
-        self._sort_column  = "date"
-        self._sort_reverse = True
+    def _lang_code_filter(self):
+        v = self.var_lang.get()
+        return None if v == "All" else _extract_lang_code(v)
 
-    def _history_where(self):
-        conditions, params = [], []
-        lang_sel = self.var_hist_lang.get()
-        if lang_sel and lang_sel != "All":
-            conditions.append("language = ?")
-            params.append(_extract_lang_code(lang_sel))
-        act_sel = self.var_hist_act.get()
-        if act_sel and act_sel != "All":
-            conditions.append("activity_type = ?")
-            params.append(act_sel)
-        from_str = self.var_hist_from.get().strip()
-        to_str   = self.var_hist_to.get().strip()
-        if from_str:
-            conditions.append("date >= ?")
-            params.append(from_str)
-        if to_str:
-            conditions.append("date <= ?")
-            params.append(to_str)
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        return where, params
+    def _activity_filter(self):
+        v = self.var_act.get()
+        return None if v == "All" else v
 
-    def load_history(self):
-        # Refresh filter dropdown options from actual DB data
-        lang_codes = [r[0] for r in self.conn.execute(
-            "SELECT DISTINCT language FROM sessions WHERE language IS NOT NULL ORDER BY language"
-        ).fetchall()]
-        lang_opts = ["All"] + [
+    def refresh(self):
+        lang_codes = self.db.distinct_languages()
+        lang_opts  = ["All"] + [
             (f"{LANGUAGES[c]} ({c})" if c in LANGUAGES else c) for c in lang_codes
         ]
-        self.cb_hist_lang["values"] = lang_opts
-
-        act_opts = ["All"] + [r[0] for r in self.conn.execute(
-            "SELECT DISTINCT activity_type FROM sessions ORDER BY activity_type"
-        ).fetchall()]
-        self.cb_hist_act["values"] = act_opts
-
-        where, params = self._history_where()
+        self.cb_lang["values"] = lang_opts
+        self.cb_act["values"]  = ["All"] + self.db.distinct_activities()
 
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._tree_id_map.clear()
 
-        cur = self.conn.execute(
-            f"SELECT id, date, language, activity_type, specific_activity, duration_minutes, notes "
-            f"FROM sessions {where} ORDER BY date DESC",
-            params,
+        rows = self.db.get_sessions(
+            lang_code=self._lang_code_filter(),
+            activity=self._activity_filter(),
+            start=self.var_from.get().strip() or None,
+            end=self.var_to.get().strip() or None,
         )
-        for row in cur.fetchall():
-            db_id, date_val, lang, act, spec, dur, notes = row
-            if lang:
-                lang_disp = f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang
-            else:
-                lang_disp = ""
+        for db_id, date_val, lang, act, spec, dur, notes in rows:
+            lang_disp = (f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang) if lang else ""
             iid = self.tree.insert(
                 "", tk.END,
                 values=(date_val, lang_disp, act, spec or "", dur, notes or ""),
             )
             self._tree_id_map[iid] = db_id
 
-    def delete_session(self):
+    def _delete_selected(self):
         selected = self.tree.selection()
         if not selected:
             messagebox.showinfo("Nothing selected", "Select a session to delete.")
@@ -614,31 +775,28 @@ class LanguageLoggerApp(tk.Tk):
             return
         if not messagebox.askyesno("Confirm Delete", "Delete this session?"):
             return
-        self.conn.execute("DELETE FROM sessions WHERE id=?", (db_id,))
-        self.conn.commit()
+        self.db.delete_session(db_id)
         self.tree.delete(iid)
         del self._tree_id_map[iid]
 
-    def _sort_tree(self, column):
+    def _sort(self, column):
         reverse = (column == self._sort_column) and not self._sort_reverse
         self._sort_column  = column
         self._sort_reverse = reverse
-
         items = [(self.tree.set(iid, column), iid) for iid in self.tree.get_children()]
         if column == "duration":
             items.sort(key=lambda x: int(x[0]) if x[0].isdigit() else 0, reverse=reverse)
         else:
             items.sort(reverse=reverse)
-
         for index, (_, iid) in enumerate(items):
             self.tree.move(iid, "", index)
 
-    def _clear_history_filter(self):
-        self.var_hist_lang.set("All")
-        self.var_hist_act.set("All")
-        self.var_hist_from.set("")
-        self.var_hist_to.set("")
-        self.load_history()
+    def _clear_filter(self):
+        self.var_lang.set("All")
+        self.var_act.set("All")
+        self.var_from.set("")
+        self.var_to.set("")
+        self.refresh()
 
     def _export_csv(self):
         path = filedialog.asksaveasfilename(
@@ -649,28 +807,22 @@ class LanguageLoggerApp(tk.Tk):
         )
         if not path:
             return
-
-        where, params = self._history_where()
-        rows = self.conn.execute(
-            f"SELECT date, language, activity_type, specific_activity, duration_minutes, notes "
-            f"FROM sessions {where} ORDER BY date DESC",
-            params,
-        ).fetchall()
-
+        rows = self.db.get_sessions(
+            lang_code=self._lang_code_filter(),
+            activity=self._activity_filter(),
+            start=self.var_from.get().strip() or None,
+            end=self.var_to.get().strip() or None,
+        )
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["Date", "Language", "Activity Type", "Specific Activity",
                              "Duration (min)", "Notes"])
-            for date_val, lang, act, spec, dur, notes in rows:
-                if lang:
-                    lang_disp = f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang
-                else:
-                    lang_disp = ""
+            for db_id, date_val, lang, act, spec, dur, notes in rows:
+                lang_disp = (f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang) if lang else ""
                 writer.writerow([date_val, lang_disp, act, spec or "", dur, notes or ""])
-
         messagebox.showinfo("Export complete", f"Exported {len(rows)} session(s) to:\n{path}")
 
-    def _on_history_double_click(self, event):
+    def _on_double_click(self, event):
         item = self.tree.identify_row(event.y)
         if not item:
             return
@@ -679,10 +831,7 @@ class LanguageLoggerApp(tk.Tk):
             self._open_edit_dialog(db_id)
 
     def _open_edit_dialog(self, db_id):
-        row = self.conn.execute(
-            "SELECT language, activity_type, specific_activity, duration_minutes, date, notes "
-            "FROM sessions WHERE id=?", (db_id,)
-        ).fetchone()
+        row = self.db.get_session(db_id)
         if not row:
             return
         lang_code, act_type, spec_act, duration, date_str, notes = row
@@ -702,37 +851,35 @@ class LanguageLoggerApp(tk.Tk):
         frame.columnconfigure(1, weight=1)
 
         def lbl(text, r):
-            ttk.Label(frame, text=text).grid(
-                row=r, column=0, sticky=tk.W, pady=6, padx=(0, 12)
-            )
+            ttk.Label(frame, text=text).grid(row=r, column=0, sticky=tk.W, pady=6, padx=(0, 12))
 
         lbl("Language:", 0)
         var_lang = tk.StringVar(value=lang_display)
-        cb_lang = ttk.Combobox(frame, textvariable=var_lang, width=28)
-        cb_lang["values"] = self._pref_languages()
+        cb_lang  = ttk.Combobox(frame, textvariable=var_lang, width=28)
+        cb_lang["values"] = self.db.pref_languages()
         cb_lang.grid(row=0, column=1, sticky=tk.EW)
 
         lbl("Activity Type:", 1)
         var_act = tk.StringVar(value=act_type or "")
-        cb_act = ttk.Combobox(
+        cb_act  = ttk.Combobox(
             frame, textvariable=var_act,
-            values=self._pref_activity_types(), state="readonly", width=28,
+            values=self.db.pref_activity_types(), state="readonly", width=28,
         )
         cb_act.grid(row=1, column=1, sticky=tk.EW)
 
         lbl("Specific Activity:", 2)
         var_spec = tk.StringVar(value=spec_act or "")
-        cb_spec = ttk.Combobox(frame, textvariable=var_spec, width=28)
-        cb_spec["values"] = self._pref_specifics(act_type) if act_type else []
+        cb_spec  = ttk.Combobox(frame, textvariable=var_spec, width=28)
+        cb_spec["values"] = self.db.pref_specifics(act_type) if act_type else []
         cb_spec.grid(row=2, column=1, sticky=tk.EW)
         cb_act.bind("<<ComboboxSelected>>",
-                    lambda e: cb_spec.configure(values=self._pref_specifics(var_act.get())))
+                    lambda e: cb_spec.configure(values=self.db.pref_specifics(var_act.get())))
 
         lbl("Duration (min):", 3)
         var_dur = tk.StringVar(value=str(duration))
-        ttk.Spinbox(
-            frame, from_=1, to=600, increment=5, textvariable=var_dur, width=10
-        ).grid(row=3, column=1, sticky=tk.W)
+        ttk.Spinbox(frame, from_=1, to=600, increment=5, textvariable=var_dur, width=10).grid(
+            row=3, column=1, sticky=tk.W
+        )
 
         lbl("Date (YYYY-MM-DD):", 4)
         var_date = tk.StringVar(value=date_str)
@@ -781,74 +928,34 @@ class LanguageLoggerApp(tk.Tk):
             messagebox.showerror("Validation Error", "Date must be in YYYY-MM-DD format.", parent=dlg)
             return
 
-        self.conn.execute(
-            "UPDATE sessions SET language=?, activity_type=?, specific_activity=?, "
-            "duration_minutes=?, date=?, notes=? WHERE id=?",
-            (language, activity_type, specific, duration, var_date.get().strip(), notes, db_id),
+        self.db.update_session(
+            db_id, language, activity_type, specific, duration, var_date.get().strip(), notes
         )
-        self.conn.commit()
         dlg.destroy()
-        self.load_history()
+        self.refresh()
 
-    # ------------------------------------------------------------------
-    # Tab 3 — Stats
-    # ------------------------------------------------------------------
 
-    def _build_stats_tab(self):
-        frame = ttk.Frame(self.tab_stats, padding=10)
+# ---------------------------------------------------------------------------
+# Tab 3 — Stats
+# ---------------------------------------------------------------------------
+
+class StatsTab(ttk.Frame):
+    def __init__(self, parent, db: Database):
+        super().__init__(parent)
+        self.db = db
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        # Filter bar (row 0)
-        filter_frame = ttk.Frame(frame)
-        filter_frame.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        self.filter_bar = FilterBar(frame, self.db, on_refresh=self.refresh)
+        self.filter_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
 
-        _lang_w = max(len(o) for o in LANGUAGE_OPTIONS)
-        ttk.Label(filter_frame, text="Language:").pack(side=tk.LEFT)
-        self.var_stats_lang = tk.StringVar(value="All")
-        self.cb_stats_lang = ttk.Combobox(
-            filter_frame, textvariable=self.var_stats_lang,
-            values=["All"] + self._pref_languages(), width=_lang_w, state="readonly",
-        )
-        self.cb_stats_lang.pack(side=tk.LEFT, padx=(4, 10))
-
-        eight_ago = (date.today() - timedelta(weeks=8)).isoformat()
-        ttk.Label(filter_frame, text="From:").pack(side=tk.LEFT)
-        self.var_stats_start = tk.StringVar(value=eight_ago)
-        ttk.Entry(filter_frame, textvariable=self.var_stats_start, width=11).pack(
-            side=tk.LEFT, padx=(4, 10)
-        )
-
-        ttk.Label(filter_frame, text="To:").pack(side=tk.LEFT)
-        self.var_stats_end = tk.StringVar(value=date.today().isoformat())
-        ttk.Entry(filter_frame, textvariable=self.var_stats_end, width=11).pack(
-            side=tk.LEFT, padx=(4, 10)
-        )
-
-        ttk.Label(filter_frame, text="By:").pack(side=tk.LEFT)
-        self.var_stats_groupby = tk.StringVar(value="Week")
-        ttk.Combobox(
-            filter_frame, textvariable=self.var_stats_groupby,
-            values=["Day", "Week", "Month"], width=6, state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 10))
-
-        ttk.Label(filter_frame, text="Quick:").pack(side=tk.LEFT)
-        self.var_stats_preset = tk.StringVar()
-        cb_preset = ttk.Combobox(
-            filter_frame, textvariable=self.var_stats_preset,
-            values=["Last week", "Last month", "Last 3 months", "Last 6 months", "Last year"],
-            width=13, state="readonly",
-        )
-        cb_preset.pack(side=tk.LEFT, padx=(4, 10))
-        cb_preset.bind("<<ComboboxSelected>>", self._apply_stats_preset)
-
-        ttk.Button(filter_frame, text="Refresh", command=self.refresh_stats).pack(side=tk.LEFT)
-
-        # Chart canvas (row 1)
         self.fig = Figure(figsize=(8, 4), dpi=96)
         self.fig.subplots_adjust(left=0.08, right=0.95, bottom=0.15, top=0.88, wspace=0.4)
-
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.get_tk_widget().grid(row=1, column=0, sticky=tk.NSEW)
 
@@ -856,32 +963,15 @@ class LanguageLoggerApp(tk.Tk):
         toolbar_frame.grid(row=2, column=0, sticky=tk.EW)
         NavigationToolbar2Tk(self.canvas, toolbar_frame)
 
-    def _apply_stats_preset(self, event=None):
-        preset = self.var_stats_preset.get()
-        today  = date.today()
-        starts = {
-            "Last week":     today - timedelta(weeks=1),
-            "Last month":    _months_ago(1),
-            "Last 3 months": _months_ago(3),
-            "Last 6 months": _months_ago(6),
-            "Last year":     _months_ago(12),
-        }
-        start = starts.get(preset)
-        if start:
-            self.var_stats_start.set(start.isoformat())
-            self.var_stats_end.set(today.isoformat())
-            self.refresh_stats()
+    def refresh_prefs(self):
+        self.filter_bar.refresh_lang_options()
 
-    def refresh_stats(self):
-        from collections import defaultdict
-
+    def refresh(self):
         self.fig.clear()
 
-        lang_display = self.var_stats_lang.get()
-        lang_code    = None if lang_display == "All" else _extract_lang_code(lang_display)
-        start_str    = self.var_stats_start.get().strip()
-        end_str      = self.var_stats_end.get().strip()
-        grouping     = self.var_stats_groupby.get()
+        start_str = self.filter_bar.start_str
+        end_str   = self.filter_bar.end_str
+        grouping  = self.filter_bar.grouping
 
         try:
             start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
@@ -890,26 +980,16 @@ class LanguageLoggerApp(tk.Tk):
             messagebox.showerror("Invalid Date", "Dates must be in YYYY-MM-DD format.")
             return
 
-        conditions, params = [], []
-        if lang_code:
-            conditions.append("language = ?")
-            params.append(lang_code)
-        if start_str:
-            conditions.append("date >= ?")
-            params.append(start_str)
-        if end_str:
-            conditions.append("date <= ?")
-            params.append(end_str)
+        rows     = self.db.get_chart_rows(
+            lang_code=self.filter_bar.lang_code,
+            start=start_str or None,
+            end=end_str or None,
+        )
+        ax_bar   = self.fig.add_subplot(1, 2, 1)
+        ax_pie   = self.fig.add_subplot(1, 2, 2)
+        prepared = _prepare_chart_data(rows, start_date, end_date, grouping)
 
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        rows = self.conn.execute(
-            f"SELECT date, activity_type, duration_minutes FROM sessions {where}", params
-        ).fetchall()
-
-        ax_bar = self.fig.add_subplot(1, 2, 1)
-        ax_pie = self.fig.add_subplot(1, 2, 2)
-
-        if not rows:
+        if prepared is None:
             for ax in (ax_bar, ax_pie):
                 ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
                         transform=ax.transAxes, fontsize=12, color="gray")
@@ -917,24 +997,9 @@ class LanguageLoggerApp(tk.Tk):
             self.canvas.draw()
             return
 
-        # ---- Consistent color mapping across both charts ----
-        all_acts  = sorted(set(act for _, act, _ in rows))
-        color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)]
-                     for i, act in enumerate(all_acts)}
+        all_acts, color_map, p_keys, p_labels, by_act_period = prepared
 
-        data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
-        eff_start  = start_date or min(data_dates)
-        eff_end    = end_date   or max(data_dates)
-        periods    = _all_periods(eff_start, eff_end, grouping)
-        p_keys     = [p[0] for p in periods]
-        p_labels   = [p[1] for p in periods]
-
-        # ---- Accumulate hours by (activity, period) ----
-        by_act_period = defaultdict(lambda: defaultdict(float))
-        for d_str, act, dur in rows:
-            by_act_period[act][_period_key(d_str, grouping)] += dur / 60
-
-        # ---- Stacked bar chart ----
+        # Stacked bar chart
         x       = list(range(len(p_keys)))
         bottoms = [0.0] * len(p_keys)
         for act in all_acts:
@@ -948,12 +1013,12 @@ class LanguageLoggerApp(tk.Tk):
         ax_bar.yaxis.set_major_formatter(FuncFormatter(lambda h, _: _fmt_time(h * 60)))
         ax_bar.set_ylabel("Duration")
         bar_title = f"Time per {grouping}"
-        if lang_display != "All":
-            bar_title += f"\n({lang_display})"
+        if self.filter_bar.lang_display != "All":
+            bar_title += f"\n({self.filter_bar.lang_display})"
         ax_bar.set_title(bar_title, fontsize=9)
         ax_bar.legend(fontsize=6, loc="upper left", framealpha=0.7)
 
-        # ---- Pie chart: activity breakdown with % and hours ----
+        # Pie chart
         by_act    = defaultdict(float)
         for _, act, dur in rows:
             by_act[act] += dur
@@ -963,112 +1028,57 @@ class LanguageLoggerApp(tk.Tk):
         pie_colors = [color_map[l] for l in pie_labels]
 
         def _autopct(pct):
-            mins = pct * total_min / 100
-            return f"{pct:.1f}%\n{_fmt_time(mins)}"
+            return f"{pct:.1f}%\n{_fmt_time(pct * total_min / 100)}"
 
         ax_pie.pie(sizes, labels=pie_labels, colors=pie_colors,
                    autopct=_autopct, startangle=140, textprops={"fontsize": 7})
-        ax_pie.set_title(
-            f"Activity Breakdown  ·  Total: {_fmt_time(total_min)}", fontsize=9
-        )
+        ax_pie.set_title(f"Activity Breakdown  ·  Total: {_fmt_time(total_min)}", fontsize=9)
 
         self.canvas.draw()
 
-    # ------------------------------------------------------------------
-    # Tab 4 — Cumulative
-    # ------------------------------------------------------------------
 
-    def _build_cumulative_tab(self):
-        frame = ttk.Frame(self.tab_cumulative, padding=10)
+# ---------------------------------------------------------------------------
+# Tab 4 — Cumulative
+# ---------------------------------------------------------------------------
+
+class CumulativeTab(ttk.Frame):
+    def __init__(self, parent, db: Database):
+        super().__init__(parent)
+        self.db = db
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.rowconfigure(2, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        # Filter bar (row 0) — mirrors Stats
-        flt = ttk.Frame(frame)
-        flt.grid(row=0, column=0, sticky=tk.EW, pady=(0, 4))
+        self.filter_bar = FilterBar(frame, self.db, on_refresh=self.refresh)
+        self.filter_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 4))
 
-        _lang_w = max(len(o) for o in LANGUAGE_OPTIONS)
-        ttk.Label(flt, text="Language:").pack(side=tk.LEFT)
-        self.var_cumul_lang = tk.StringVar(value="All")
-        self.cb_cumul_lang = ttk.Combobox(
-            flt, textvariable=self.var_cumul_lang,
-            values=["All"] + self._pref_languages(), width=_lang_w, state="readonly",
+        self.var_summary = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.var_summary, foreground="#555555", anchor=tk.W).grid(
+            row=1, column=0, sticky=tk.EW, padx=2, pady=(0, 4)
         )
-        self.cb_cumul_lang.pack(side=tk.LEFT, padx=(4, 10))
 
-        eight_ago = (date.today() - timedelta(weeks=8)).isoformat()
-        ttk.Label(flt, text="From:").pack(side=tk.LEFT)
-        self.var_cumul_start = tk.StringVar(value=eight_ago)
-        ttk.Entry(flt, textvariable=self.var_cumul_start, width=11).pack(side=tk.LEFT, padx=(4, 10))
-
-        ttk.Label(flt, text="To:").pack(side=tk.LEFT)
-        self.var_cumul_end = tk.StringVar(value=date.today().isoformat())
-        ttk.Entry(flt, textvariable=self.var_cumul_end, width=11).pack(side=tk.LEFT, padx=(4, 10))
-
-        ttk.Label(flt, text="By:").pack(side=tk.LEFT)
-        self.var_cumul_groupby = tk.StringVar(value="Week")
-        ttk.Combobox(
-            flt, textvariable=self.var_cumul_groupby,
-            values=["Day", "Week", "Month"], width=6, state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 10))
-
-        ttk.Label(flt, text="Quick:").pack(side=tk.LEFT)
-        self.var_cumul_preset = tk.StringVar()
-        cb_cp = ttk.Combobox(
-            flt, textvariable=self.var_cumul_preset,
-            values=["Last week", "Last month", "Last 3 months", "Last 6 months", "Last year"],
-            width=13, state="readonly",
-        )
-        cb_cp.pack(side=tk.LEFT, padx=(4, 10))
-        cb_cp.bind("<<ComboboxSelected>>", self._apply_cumulative_preset)
-
-        ttk.Button(flt, text="Refresh", command=self.refresh_cumulative).pack(side=tk.LEFT)
-
-        # Summary bar (row 1)
-        self.var_cumul_summary = tk.StringVar(value="")
-        ttk.Label(
-            frame, textvariable=self.var_cumul_summary,
-            foreground="#555555", anchor=tk.W,
-        ).grid(row=1, column=0, sticky=tk.EW, padx=2, pady=(0, 4))
-
-        # Chart canvas (row 2)
-        self.fig_cumul = Figure(figsize=(8, 4), dpi=96)
-        self.fig_cumul.subplots_adjust(left=0.1, right=0.97, bottom=0.15, top=0.88)
-
-        self.canvas_cumul = FigureCanvasTkAgg(self.fig_cumul, master=frame)
-        self.canvas_cumul.get_tk_widget().grid(row=2, column=0, sticky=tk.NSEW)
+        self.fig = Figure(figsize=(8, 4), dpi=96)
+        self.fig.subplots_adjust(left=0.1, right=0.97, bottom=0.15, top=0.88)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
+        self.canvas.get_tk_widget().grid(row=2, column=0, sticky=tk.NSEW)
 
         toolbar_frame = ttk.Frame(frame)
         toolbar_frame.grid(row=3, column=0, sticky=tk.EW)
-        NavigationToolbar2Tk(self.canvas_cumul, toolbar_frame)
+        NavigationToolbar2Tk(self.canvas, toolbar_frame)
 
-    def _apply_cumulative_preset(self, event=None):
-        preset = self.var_cumul_preset.get()
-        today  = date.today()
-        starts = {
-            "Last week":     today - timedelta(weeks=1),
-            "Last month":    _months_ago(1),
-            "Last 3 months": _months_ago(3),
-            "Last 6 months": _months_ago(6),
-            "Last year":     _months_ago(12),
-        }
-        start = starts.get(preset)
-        if start:
-            self.var_cumul_start.set(start.isoformat())
-            self.var_cumul_end.set(today.isoformat())
-            self.refresh_cumulative()
+    def refresh_prefs(self):
+        self.filter_bar.refresh_lang_options()
 
-    def refresh_cumulative(self):
-        from collections import defaultdict
+    def refresh(self):
+        self.fig.clear()
 
-        self.fig_cumul.clear()
-
-        lang_display = self.var_cumul_lang.get()
-        lang_code    = None if lang_display == "All" else _extract_lang_code(lang_display)
-        start_str    = self.var_cumul_start.get().strip()
-        end_str      = self.var_cumul_end.get().strip()
-        grouping     = self.var_cumul_groupby.get()
+        start_str = self.filter_bar.start_str
+        end_str   = self.filter_bar.end_str
+        grouping  = self.filter_bar.grouping
 
         try:
             start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
@@ -1077,110 +1087,79 @@ class LanguageLoggerApp(tk.Tk):
             messagebox.showerror("Invalid Date", "Dates must be in YYYY-MM-DD format.")
             return
 
-        conditions, params = [], []
-        if lang_code:
-            conditions.append("language = ?")
-            params.append(lang_code)
-        if start_str:
-            conditions.append("date >= ?")
-            params.append(start_str)
-        if end_str:
-            conditions.append("date <= ?")
-            params.append(end_str)
+        rows     = self.db.get_chart_rows(
+            lang_code=self.filter_bar.lang_code,
+            start=start_str or None,
+            end=end_str or None,
+        )
+        ax       = self.fig.add_subplot(1, 1, 1)
+        prepared = _prepare_chart_data(rows, start_date, end_date, grouping)
 
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        rows = self.conn.execute(
-            f"SELECT date, activity_type, duration_minutes FROM sessions {where}", params
-        ).fetchall()
-
-        ax = self.fig_cumul.add_subplot(1, 1, 1)
-
-        if not rows:
-            self.var_cumul_summary.set("No data in the selected range.")
+        if prepared is None:
+            self.var_summary.set("No data in the selected range.")
             ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
                     transform=ax.transAxes, fontsize=12, color="gray")
             ax.set_axis_off()
-            self.canvas_cumul.draw()
+            self.canvas.draw()
             return
 
-        # ---- Summary ----
+        all_acts, color_map, p_keys, p_labels, by_act_period = prepared
+
+        # Summary
         total_sessions = len(rows)
         total_min      = sum(dur for _, _, dur in rows)
-        avg_min        = total_min / total_sessions
         act_totals     = defaultdict(float)
         for _, act, dur in rows:
             act_totals[act] += dur
         top_act = max(act_totals, key=act_totals.get)
-        self.var_cumul_summary.set(
-            f"Sessions: {total_sessions}   ·   "
-            f"Total: {_fmt_time(total_min)}   ·   "
-            f"Avg session: {_fmt_time(avg_min)}   ·   "
-            f"Top activity: {top_act}"
+        self.var_summary.set(
+            f"Sessions: {total_sessions}   ·   Total: {_fmt_time(total_min)}   ·   "
+            f"Avg session: {_fmt_time(total_min / total_sessions)}   ·   Top activity: {top_act}"
         )
 
-        # ---- Consistent color mapping ----
-        all_acts  = sorted(set(act for _, act, _ in rows))
-        color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)]
-                     for i, act in enumerate(all_acts)}
-
-        data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
-        eff_start  = start_date or min(data_dates)
-        eff_end    = end_date   or max(data_dates)
-        periods    = _all_periods(eff_start, eff_end, grouping)
-        p_keys     = [p[0] for p in periods]
-        p_labels   = [p[1] for p in periods]
-
-        # ---- Accumulate per (activity, period) ----
-        by_act_period = defaultdict(lambda: defaultdict(float))
-        for d_str, act, dur in rows:
-            by_act_period[act][_period_key(d_str, grouping)] += dur / 60
-
-        # ---- Build cumulative series per activity ----
-        cumul = {act: [] for act in all_acts}
+        # Cumulative series
+        cumul   = {act: [] for act in all_acts}
         running = {act: 0.0 for act in all_acts}
         for k in p_keys:
             for act in all_acts:
                 running[act] += by_act_period[act].get(k, 0.0)
                 cumul[act].append(running[act])
 
-        # ---- Stacked area chart ----
         x = list(range(len(p_keys)))
         ax.stackplot(
-            x,
-            [cumul[act] for act in all_acts],
-            labels=all_acts,
-            colors=[color_map[act] for act in all_acts],
-            alpha=0.85,
+            x, [cumul[act] for act in all_acts],
+            labels=all_acts, colors=[color_map[act] for act in all_acts], alpha=0.85,
         )
-
         ax.set_xticks(x)
         label_fs = max(5, min(8, 80 // max(len(p_keys), 1)))
         ax.set_xticklabels(p_labels, rotation=40, ha="right", fontsize=label_fs)
         ax.yaxis.set_major_formatter(FuncFormatter(lambda h, _: _fmt_time(h * 60)))
         ax.set_ylabel("Cumulative Duration")
         title = f"Cumulative Time per {grouping}"
-        if lang_display != "All":
-            title += f"  ({lang_display})"
+        if self.filter_bar.lang_display != "All":
+            title += f"  ({self.filter_bar.lang_display})"
         ax.set_title(title, fontsize=10)
         ax.legend(fontsize=7, loc="upper left", framealpha=0.7)
 
-        self.canvas_cumul.draw()
+        self.canvas.draw()
 
-    # ------------------------------------------------------------------
-    # Tab 5 — Settings
-    # ------------------------------------------------------------------
 
-    def _save_all_prefs(self):
-        self._save_lang_prefs()
-        self._save_activity_prefs()
-        self._save_specific_prefs()
-        messagebox.showinfo("Saved", "Settings saved.")
+# ---------------------------------------------------------------------------
+# Tab 5 — Settings
+# ---------------------------------------------------------------------------
 
-    def _build_settings_tab(self):
-        ttk.Button(self.tab_settings, text="Save Settings", command=self._save_all_prefs).pack(
+class SettingsTab(ttk.Frame):
+    def __init__(self, parent, db: Database, on_prefs_changed):
+        super().__init__(parent)
+        self.db               = db
+        self._on_prefs_changed = on_prefs_changed
+        self._build()
+
+    def _build(self):
+        ttk.Button(self, text="Save Settings", command=self._save_all).pack(
             side=tk.BOTTOM, anchor=tk.W, padx=12, pady=(4, 8)
         )
-        sub = ttk.Notebook(self.tab_settings)
+        sub = ttk.Notebook(self)
         sub.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
 
         st_lang = ttk.Frame(sub)
@@ -1191,13 +1170,20 @@ class LanguageLoggerApp(tk.Tk):
         sub.add(st_act,  text="  Activity Types  ")
         sub.add(st_spec, text="  Specific Activities  ")
 
-        self._build_lang_settings(st_lang)
-        self._build_activity_settings(st_act)
-        self._build_specific_settings(st_spec)
+        self._build_lang_tab(st_lang)
+        self._build_activity_tab(st_act)
+        self._build_specific_tab(st_spec)
 
-    # -- Languages sub-tab --
+    def _save_all(self):
+        self._save_lang()
+        self._save_activity()
+        self._save_specific()
+        self._on_prefs_changed()
+        messagebox.showinfo("Saved", "Settings saved.")
 
-    def _build_lang_settings(self, parent):
+    # -- Languages --
+
+    def _build_lang_tab(self, parent):
         frame = ttk.Frame(parent, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.rowconfigure(1, weight=1)
@@ -1214,17 +1200,13 @@ class LanguageLoggerApp(tk.Tk):
         lb_frame.rowconfigure(0, weight=1)
         lb_frame.columnconfigure(0, weight=1)
 
-        self.lb_languages = tk.Listbox(
-            lb_frame, selectmode=tk.MULTIPLE, width=36, exportselection=False
-        )
+        self.lb_languages = tk.Listbox(lb_frame, selectmode=tk.MULTIPLE, width=36, exportselection=False)
         vsb = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL, command=self.lb_languages.yview)
         self.lb_languages.configure(yscrollcommand=vsb.set)
         self.lb_languages.grid(row=0, column=0, sticky=tk.NSEW)
         vsb.grid(row=0, column=1, sticky=tk.NS)
 
-        enabled_codes = {r[0] for r in self.conn.execute(
-            "SELECT code FROM pref_languages WHERE enabled=1"
-        )}
+        enabled_codes = self.db.enabled_lang_codes()
         for i, opt in enumerate(LANGUAGE_OPTIONS):
             self.lb_languages.insert(tk.END, opt)
             if _extract_lang_code(opt) in enabled_codes:
@@ -1237,19 +1219,13 @@ class LanguageLoggerApp(tk.Tk):
         ttk.Button(btn_frame, text="Clear All",
                    command=lambda: self.lb_languages.selection_clear(0, tk.END)).pack(side=tk.LEFT)
 
-    def _save_lang_prefs(self):
-        selected = {_extract_lang_code(LANGUAGE_OPTIONS[i])
-                    for i in self.lb_languages.curselection()}
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO pref_languages (code, enabled) VALUES (?, ?)",
-            [(code, 1 if code in selected else 0) for code in LANGUAGES],
-        )
-        self.conn.commit()
-        self._refresh_log_form()
+    def _save_lang(self):
+        selected = {_extract_lang_code(LANGUAGE_OPTIONS[i]) for i in self.lb_languages.curselection()}
+        self.db.save_lang_prefs(selected)
 
-    # -- Activity Types sub-tab --
+    # -- Activity Types --
 
-    def _build_activity_settings(self, parent):
+    def _build_activity_tab(self, parent):
         frame = ttk.Frame(parent, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1259,28 +1235,19 @@ class LanguageLoggerApp(tk.Tk):
             foreground="gray",
         ).grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
 
-        enabled = {r[0] for r in self.conn.execute(
-            "SELECT name FROM pref_activity_types WHERE enabled=1"
-        )}
+        enabled = self.db.enabled_activity_names()
         self._act_vars = {}
         for i, name in enumerate(ACTIVITIES):
             var = tk.BooleanVar(value=name in enabled)
             self._act_vars[name] = var
-            ttk.Checkbutton(frame, text=name, variable=var).grid(
-                row=i + 1, column=0, sticky=tk.W, pady=3
-            )
+            ttk.Checkbutton(frame, text=name, variable=var).grid(row=i + 1, column=0, sticky=tk.W, pady=3)
 
-    def _save_activity_prefs(self):
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO pref_activity_types (name, enabled) VALUES (?, ?)",
-            [(name, 1 if var.get() else 0) for name, var in self._act_vars.items()],
-        )
-        self.conn.commit()
-        self._refresh_log_form()
+    def _save_activity(self):
+        self.db.save_activity_prefs({name: var.get() for name, var in self._act_vars.items()})
 
-    # -- Specific Activities sub-tab --
+    # -- Specific Activities --
 
-    def _build_specific_settings(self, parent):
+    def _build_specific_tab(self, parent):
         frame = ttk.Frame(parent, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.rowconfigure(1, weight=1)
@@ -1292,7 +1259,6 @@ class LanguageLoggerApp(tk.Tk):
             foreground="gray",
         ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
 
-        # Left: activity type selector
         left = ttk.LabelFrame(frame, text="Activity Type", padding=6)
         left.grid(row=1, column=0, sticky=tk.NSEW, padx=(0, 8))
         left.rowconfigure(0, weight=1)
@@ -1305,15 +1271,12 @@ class LanguageLoggerApp(tk.Tk):
         for at in ACTIVITIES:
             self.lb_act_sel.insert(tk.END, at)
 
-        # Right: specific activities for selected type
         right = ttk.LabelFrame(frame, text="Specific Activities  (selected = enabled)", padding=6)
         right.grid(row=1, column=1, sticky=tk.NSEW)
         right.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
 
-        self.lb_specifics = tk.Listbox(
-            right, selectmode=tk.MULTIPLE, width=26, exportselection=False
-        )
+        self.lb_specifics = tk.Listbox(right, selectmode=tk.MULTIPLE, width=26, exportselection=False)
         sp_vsb = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.lb_specifics.yview)
         self.lb_specifics.configure(yscrollcommand=sp_vsb.set)
         self.lb_specifics.grid(row=0, column=0, sticky=tk.NSEW)
@@ -1322,43 +1285,26 @@ class LanguageLoggerApp(tk.Tk):
         add_fr = ttk.Frame(right)
         add_fr.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
         self.var_new_spec = tk.StringVar()
-        ttk.Entry(add_fr, textvariable=self.var_new_spec, width=18).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
+        ttk.Entry(add_fr, textvariable=self.var_new_spec, width=18).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(add_fr, text="Add", command=self._add_specific).pack(side=tk.LEFT)
 
         ttk.Button(right, text="Remove Selected", command=self._remove_specific).grid(
             row=2, column=0, sticky=tk.W, pady=(4, 0)
         )
 
-        # In-memory state: {activity_type: {"items": [(name, is_custom)], "selected": set}}
-        self._spec_state        = {}
+        self._spec_state        = self.db.load_spec_state()
         self._spec_current_type = None
-        self._load_spec_state()
 
         self.lb_act_sel.bind("<<ListboxSelect>>", self._on_spec_type_select)
         if self.lb_act_sel.size() > 0:
             self.lb_act_sel.selection_set(0)
             self._on_spec_type_select()
 
-    def _load_spec_state(self):
-        for act_type in ACTIVITIES:
-            rows = self.conn.execute(
-                "SELECT name, is_custom, enabled FROM pref_specific_activities "
-                "WHERE activity_type=? ORDER BY is_custom, name",
-                (act_type,),
-            ).fetchall()
-            self._spec_state[act_type] = {
-                "items":    [(r[0], bool(r[1])) for r in rows],
-                "selected": {r[0] for r in rows if r[2]},
-            }
-
     def _on_spec_type_select(self, event=None):
         sel = self.lb_act_sel.curselection()
         if not sel:
             return
         new_type = self.lb_act_sel.get(sel[0])
-        # Persist current right-panel selection before switching
         if self._spec_current_type in self._spec_state:
             items = self._spec_state[self._spec_current_type]["items"]
             self._spec_state[self._spec_current_type]["selected"] = {
@@ -1403,39 +1349,59 @@ class LanguageLoggerApp(tk.Tk):
             state["selected"].discard(name)
         self._refresh_spec_listbox()
 
-    def _save_specific_prefs(self):
-        # Flush the currently visible right-panel selections into state
+    def _save_specific(self):
         if self._spec_current_type in self._spec_state:
             items = self._spec_state[self._spec_current_type]["items"]
             self._spec_state[self._spec_current_type]["selected"] = {
                 items[i][0] for i in self.lb_specifics.curselection()
             }
+        self.db.save_specific_prefs(self._spec_state)
 
-        for act_type, state in self._spec_state.items():
-            existing_in_db = {r[0] for r in self.conn.execute(
-                "SELECT name FROM pref_specific_activities WHERE activity_type=?",
-                (act_type,),
-            )}
-            current_names = {item[0] for item in state["items"]}
 
-            # Remove items deleted from the list
-            for name in existing_in_db - current_names:
-                self.conn.execute(
-                    "DELETE FROM pref_specific_activities WHERE activity_type=? AND name=?",
-                    (act_type, name),
-                )
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
-            # Upsert remaining
-            for name, is_custom in state["items"]:
-                enabled = 1 if name in state["selected"] else 0
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO pref_specific_activities "
-                    "(activity_type, name, enabled, is_custom) VALUES (?, ?, ?, ?)",
-                    (act_type, name, enabled, 1 if is_custom else 0),
-                )
+class LanguageLoggerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Language Learning Logger")
+        self.geometry("920x620")
+        self.minsize(740, 520)
 
-        self.conn.commit()
-        self._refresh_log_form()
+        db = Database(DB_PATH)
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self.tab_log      = LogTab(self.notebook, db)
+        self.tab_history  = HistoryTab(self.notebook, db)
+        self.tab_stats    = StatsTab(self.notebook, db)
+        self.tab_cumul    = CumulativeTab(self.notebook, db)
+        self.tab_settings = SettingsTab(self.notebook, db, on_prefs_changed=self._on_prefs_changed)
+
+        self.notebook.add(self.tab_log,      text="  Log Session  ")
+        self.notebook.add(self.tab_history,  text="  History  ")
+        self.notebook.add(self.tab_stats,    text="  Stats  ")
+        self.notebook.add(self.tab_cumul,    text="  Cumulative  ")
+        self.notebook.add(self.tab_settings, text="  Settings  ")
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
+        self.bind("<Control-s>", lambda e: self.tab_log.save_session())
+
+    def _on_prefs_changed(self):
+        self.tab_log.refresh_prefs()
+        self.tab_stats.refresh_prefs()
+        self.tab_cumul.refresh_prefs()
+
+    def _on_tab_change(self, event):
+        selected = self.notebook.select()
+        if selected == str(self.tab_history):
+            self.tab_history.refresh()
+        elif selected == str(self.tab_stats):
+            self.tab_stats.refresh()
+        elif selected == str(self.tab_cumul):
+            self.tab_cumul.refresh()
 
 
 if __name__ == "__main__":
