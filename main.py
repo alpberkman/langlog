@@ -6,6 +6,7 @@ import sqlite3
 import csv
 import os
 import sys
+import threading
 from collections import defaultdict
 from datetime import date, timedelta, datetime
 
@@ -1428,6 +1429,14 @@ class SettingsTab(ttk.Frame):
 # Application
 # ---------------------------------------------------------------------------
 
+def _preload_matplotlib():
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure  # noqa: F401
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: F401
+    from matplotlib.ticker import FuncFormatter  # noqa: F401
+
+
 class LanguageLoggerApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1454,6 +1463,8 @@ class LanguageLoggerApp(tk.Tk):
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
         self.bind("<Control-s>", self._on_ctrl_s)
+
+        threading.Thread(target=_preload_matplotlib, daemon=True).start()
 
     def _on_ctrl_s(self, event=None):
         selected = self.notebook.select()
