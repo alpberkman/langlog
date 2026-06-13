@@ -46,6 +46,12 @@ ACTIVITIES = {
 }
 
 
+_CHART_COLORS = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
+    "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
+]
+
+
 def _extract_lang_code(display_value: str) -> str:
     if display_value.endswith(")") and "(" in display_value:
         return display_value.rsplit("(", 1)[-1].rstrip(")")
@@ -411,6 +417,13 @@ class LanguageLoggerApp(tk.Tk):
             side=tk.LEFT, padx=(4, 16)
         )
 
+        ttk.Label(filter_frame, text="Group by:").pack(side=tk.LEFT)
+        self.var_stats_groupby = tk.StringVar(value="Week")
+        ttk.Combobox(
+            filter_frame, textvariable=self.var_stats_groupby,
+            values=["Day", "Week", "Month"], width=8, state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 16))
+
         ttk.Button(filter_frame, text="Refresh", command=self.refresh_stats).pack(side=tk.LEFT)
 
         # Chart canvas (row 1)
@@ -425,12 +438,15 @@ class LanguageLoggerApp(tk.Tk):
         NavigationToolbar2Tk(self.canvas, toolbar_frame)
 
     def refresh_stats(self):
+        from collections import defaultdict
+
         self.fig.clear()
 
         lang_display = self.var_stats_lang.get()
         lang_code    = None if lang_display == "All" else _extract_lang_code(lang_display)
         start_str    = self.var_stats_start.get().strip()
         end_str      = self.var_stats_end.get().strip()
+        grouping     = self.var_stats_groupby.get()
 
         try:
             start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
@@ -466,57 +482,85 @@ class LanguageLoggerApp(tk.Tk):
             self.canvas.draw()
             return
 
-        # ---- Bar chart: hours per week within the selected date range ----
-        today = date.today()
-        effective_end = end_date or today
-        if start_date:
-            ws = start_date - timedelta(days=start_date.weekday())
-        else:
-            ws = today - timedelta(days=today.weekday() + 7 * 7)
+        # ---- Consistent color mapping across both charts ----
+        all_acts  = sorted(set(act for _, act, _ in rows))
+        color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)]
+                     for i, act in enumerate(all_acts)}
 
-        weeks, week_hours = [], []
-        while ws <= effective_end:
-            we    = ws + timedelta(days=6)
-            total = sum(
-                dur for d, _, dur in rows
-                if ws.isoformat() <= d <= we.isoformat()
-            )
-            weeks.append(ws.strftime("%b %d"))
-            week_hours.append(round(total / 60, 2))
-            ws += timedelta(weeks=1)
+        # ---- Period generation helpers ----
+        def period_key(d_str):
+            d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            if grouping == "Day":
+                return d.isoformat()
+            if grouping == "Week":
+                return (d - timedelta(days=d.weekday())).isoformat()
+            return d_str[:7]  # Month
 
-        bars = ax_bar.bar(range(len(weeks)), week_hours, color="#4a90d9")
-        ax_bar.set_xticks(range(len(weeks)))
-        label_fs = max(5, min(8, 80 // max(len(weeks), 1)))
-        ax_bar.set_xticklabels(weeks, rotation=40, ha="right", fontsize=label_fs)
+        def all_periods(s, e):
+            result = []
+            if grouping == "Day":
+                d = s
+                while d <= e:
+                    result.append((d.isoformat(), d.strftime("%b %d")))
+                    d += timedelta(days=1)
+            elif grouping == "Week":
+                ws = s - timedelta(days=s.weekday())
+                while ws <= e:
+                    result.append((ws.isoformat(), ws.strftime("%b %d")))
+                    ws += timedelta(weeks=1)
+            else:
+                d = date(s.year, s.month, 1)
+                while d <= e:
+                    result.append((d.strftime("%Y-%m"), d.strftime("%b '%y")))
+                    nxt = d.month % 12 + 1
+                    d   = date(d.year + (1 if d.month == 12 else 0), nxt, 1)
+            return result
+
+        data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
+        eff_start  = start_date or min(data_dates)
+        eff_end    = end_date   or max(data_dates)
+        periods    = all_periods(eff_start, eff_end)
+        p_keys     = [p[0] for p in periods]
+        p_labels   = [p[1] for p in periods]
+
+        # ---- Accumulate hours by (activity, period) ----
+        by_act_period = defaultdict(lambda: defaultdict(float))
+        for d_str, act, dur in rows:
+            by_act_period[act][period_key(d_str)] += dur / 60
+
+        # ---- Stacked bar chart ----
+        x       = list(range(len(p_keys)))
+        bottoms = [0.0] * len(p_keys)
+        for act in all_acts:
+            vals = [by_act_period[act].get(k, 0.0) for k in p_keys]
+            ax_bar.bar(x, vals, bottom=bottoms, label=act, color=color_map[act])
+            bottoms = [b + v for b, v in zip(bottoms, vals)]
+
+        ax_bar.set_xticks(x)
+        label_fs = max(5, min(8, 80 // max(len(p_keys), 1)))
+        ax_bar.set_xticklabels(p_labels, rotation=40, ha="right", fontsize=label_fs)
         ax_bar.set_ylabel("Hours")
-        bar_title = "Hours per Week"
+        bar_title = f"Hours per {grouping}"
         if lang_display != "All":
             bar_title += f"\n({lang_display})"
         ax_bar.set_title(bar_title, fontsize=9)
-        for bar, val in zip(bars, week_hours):
-            if val > 0:
-                ax_bar.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.01,
-                    f"{val:.1f}", ha="center", va="bottom", fontsize=6,
-                )
+        ax_bar.legend(fontsize=6, loc="upper left", framealpha=0.7)
 
-        # ---- Pie chart: activity breakdown with % and hours in each slice ----
-        from collections import defaultdict
-        by_act   = defaultdict(int)
+        # ---- Pie chart: activity breakdown with % and hours ----
+        by_act    = defaultdict(float)
         for _, act, dur in rows:
             by_act[act] += dur
         pie_labels = list(by_act.keys())
         sizes      = [by_act[l] for l in pie_labels]
         total_min  = sum(sizes)
+        pie_colors = [color_map[l] for l in pie_labels]
 
         def _autopct(pct):
             h = pct * total_min / 100 / 60
             return f"{pct:.1f}%\n{h:.1f}h"
 
-        ax_pie.pie(sizes, labels=pie_labels, autopct=_autopct, startangle=140,
-                   textprops={"fontsize": 7})
+        ax_pie.pie(sizes, labels=pie_labels, colors=pie_colors,
+                   autopct=_autopct, startangle=140, textprops={"fontsize": 7})
         total_h = round(total_min / 60, 1)
         ax_pie.set_title(f"Activity Breakdown  ·  Total: {total_h}h", fontsize=9)
 
