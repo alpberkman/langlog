@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import sqlite3
@@ -6,11 +8,6 @@ import os
 import sys
 from collections import defaultdict
 from datetime import date, timedelta, datetime
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.ticker import FuncFormatter
 
 DB_PATH = (
     sys.argv[1]
@@ -531,7 +528,7 @@ class LogTab(ttk.Frame):
         tmpl_lf.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
         tmpl_lf.columnconfigure(0, weight=1)
 
-        self.tmpl_canvas = tk.Canvas(tmpl_lf, highlightthickness=0, height=180)
+        self.tmpl_canvas = tk.Canvas(tmpl_lf, highlightthickness=0)
         tmpl_vsb = ttk.Scrollbar(tmpl_lf, orient=tk.VERTICAL, command=self.tmpl_canvas.yview)
         self.tmpl_canvas.configure(yscrollcommand=tmpl_vsb.set)
         self.tmpl_canvas.grid(row=0, column=0, sticky=tk.NSEW)
@@ -973,7 +970,8 @@ class HistoryTab(ttk.Frame):
 class StatsTab(ttk.Frame):
     def __init__(self, parent, db: Database):
         super().__init__(parent)
-        self.db = db
+        self.db  = db
+        self.fig = None
         self._build()
 
     def _build(self):
@@ -981,15 +979,21 @@ class StatsTab(ttk.Frame):
         frame.pack(fill=tk.BOTH, expand=True)
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
+        self._chart_parent = frame
 
         self.filter_bar = FilterBar(frame, self.db, on_refresh=self.refresh)
         self.filter_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
 
+    def _init_chart(self):
+        import matplotlib
+        matplotlib.use("TkAgg")
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        frame = self._chart_parent
         self.fig = Figure(figsize=(8, 4), dpi=96)
         self.fig.subplots_adjust(left=0.08, right=0.95, bottom=0.15, top=0.88, wspace=0.4)
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.get_tk_widget().grid(row=1, column=0, sticky=tk.NSEW)
-
         toolbar_frame = ttk.Frame(frame)
         toolbar_frame.grid(row=2, column=0, sticky=tk.EW)
         NavigationToolbar2Tk(self.canvas, toolbar_frame)
@@ -998,6 +1002,9 @@ class StatsTab(ttk.Frame):
         self.filter_bar.refresh_lang_options()
 
     def refresh(self):
+        if self.fig is None:
+            self._init_chart()
+        from matplotlib.ticker import FuncFormatter
         self.fig.clear()
 
         start_str = self.filter_bar.start_str
@@ -1075,7 +1082,8 @@ class StatsTab(ttk.Frame):
 class CumulativeTab(ttk.Frame):
     def __init__(self, parent, db: Database):
         super().__init__(parent)
-        self.db = db
+        self.db  = db
+        self.fig = None
         self._build()
 
     def _build(self):
@@ -1083,6 +1091,7 @@ class CumulativeTab(ttk.Frame):
         frame.pack(fill=tk.BOTH, expand=True)
         frame.rowconfigure(2, weight=1)
         frame.columnconfigure(0, weight=1)
+        self._chart_parent = frame
 
         self.filter_bar = FilterBar(frame, self.db, on_refresh=self.refresh)
         self.filter_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 4))
@@ -1092,11 +1101,16 @@ class CumulativeTab(ttk.Frame):
             row=1, column=0, sticky=tk.EW, padx=2, pady=(0, 4)
         )
 
+    def _init_chart(self):
+        import matplotlib
+        matplotlib.use("TkAgg")
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        frame = self._chart_parent
         self.fig = Figure(figsize=(8, 4), dpi=96)
         self.fig.subplots_adjust(left=0.1, right=0.97, bottom=0.15, top=0.88)
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
         self.canvas.get_tk_widget().grid(row=2, column=0, sticky=tk.NSEW)
-
         toolbar_frame = ttk.Frame(frame)
         toolbar_frame.grid(row=3, column=0, sticky=tk.EW)
         NavigationToolbar2Tk(self.canvas, toolbar_frame)
@@ -1105,6 +1119,9 @@ class CumulativeTab(ttk.Frame):
         self.filter_bar.refresh_lang_options()
 
     def refresh(self):
+        if self.fig is None:
+            self._init_chart()
+        from matplotlib.ticker import FuncFormatter
         self.fig.clear()
 
         start_str = self.filter_bar.start_str
