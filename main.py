@@ -1,6 +1,7 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import sqlite3
+import csv
 import os
 from datetime import date, timedelta, datetime
 import matplotlib
@@ -109,6 +110,15 @@ class LanguageLoggerApp(tk.Tk):
                 is_custom     INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (activity_type, name)
             );
+            CREATE TABLE IF NOT EXISTS templates (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                name              TEXT    NOT NULL UNIQUE,
+                language          TEXT,
+                activity_type     TEXT    NOT NULL,
+                specific_activity TEXT,
+                duration_minutes  INTEGER NOT NULL,
+                notes             TEXT
+            );
         """)
         self.conn.commit()
         self._seed_prefs()
@@ -167,19 +177,22 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.tab_log      = ttk.Frame(self.notebook)
-        self.tab_history  = ttk.Frame(self.notebook)
-        self.tab_stats    = ttk.Frame(self.notebook)
-        self.tab_settings = ttk.Frame(self.notebook)
+        self.tab_log        = ttk.Frame(self.notebook)
+        self.tab_history    = ttk.Frame(self.notebook)
+        self.tab_stats      = ttk.Frame(self.notebook)
+        self.tab_cumulative = ttk.Frame(self.notebook)
+        self.tab_settings   = ttk.Frame(self.notebook)
 
-        self.notebook.add(self.tab_log,      text="  Log Session  ")
-        self.notebook.add(self.tab_history,  text="  History  ")
-        self.notebook.add(self.tab_stats,    text="  Stats  ")
-        self.notebook.add(self.tab_settings, text="  Settings  ")
+        self.notebook.add(self.tab_log,        text="  Log Session  ")
+        self.notebook.add(self.tab_history,    text="  History  ")
+        self.notebook.add(self.tab_stats,      text="  Stats  ")
+        self.notebook.add(self.tab_cumulative, text="  Cumulative  ")
+        self.notebook.add(self.tab_settings,   text="  Settings  ")
 
         self._build_log_tab()
         self._build_history_tab()
         self._build_stats_tab()
+        self._build_cumulative_tab()
         self._build_settings_tab()
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
@@ -190,6 +203,8 @@ class LanguageLoggerApp(tk.Tk):
             self.load_history()
         elif tab == 2:
             self.refresh_stats()
+        elif tab == 3:
+            self.refresh_cumulative()
 
     # ------------------------------------------------------------------
     # Tab 1 — Log Session
@@ -244,9 +259,20 @@ class LanguageLoggerApp(tk.Tk):
         self.txt_notes.configure(yscrollcommand=sb.set)
         sb.grid(row=5, column=2, sticky=tk.NS)
 
-        ttk.Button(frame, text="Save Session", command=self.save_session).grid(
-            row=6, column=1, sticky=tk.W, pady=(12, 0)
+        btn_bar = ttk.Frame(frame)
+        btn_bar.grid(row=6, column=1, columnspan=2, sticky=tk.EW, pady=(12, 0))
+        ttk.Button(btn_bar, text="Save Session", command=self.save_session).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text="Make Template", command=self._make_template).pack(side=tk.RIGHT)
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).grid(
+            row=7, column=0, columnspan=3, sticky=tk.EW, pady=(14, 0)
         )
+        tmpl_lf = ttk.LabelFrame(frame, text=" Saved Templates ", padding=(8, 6))
+        tmpl_lf.grid(row=8, column=0, columnspan=3, sticky=tk.NSEW, pady=(4, 0))
+        tmpl_lf.columnconfigure(0, weight=1)
+        self.tmpl_inner = ttk.Frame(tmpl_lf)
+        self.tmpl_inner.pack(fill=tk.BOTH, expand=True)
+        self._refresh_templates()
 
     def _on_activity_type_change(self, event=None):
         activity = self.var_activity_type.get()
@@ -263,6 +289,8 @@ class LanguageLoggerApp(tk.Tk):
             self.cb_specific["values"] = specs
         if hasattr(self, "cb_stats_lang"):
             self.cb_stats_lang["values"] = ["All"] + self._pref_languages()
+        if hasattr(self, "cb_cumul_lang"):
+            self.cb_cumul_lang["values"] = ["All"] + self._pref_languages()
 
     def save_session(self):
         lang_display = self.var_language.get().strip()
@@ -303,6 +331,91 @@ class LanguageLoggerApp(tk.Tk):
         self.cb_specific["values"] = []
         self.var_duration.set(30)
         self.txt_notes.delete("1.0", tk.END)
+
+    def _make_template(self):
+        activity_type = self.var_activity_type.get().strip()
+        if not activity_type:
+            messagebox.showerror("Validation Error", "Activity Type is required to make a template.")
+            return
+        name = simpledialog.askstring("Template Name", "Enter a name for this template:", parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+
+        lang_display = self.var_language.get().strip()
+        language     = _extract_lang_code(lang_display) if lang_display else None
+        specific     = self.var_specific.get().strip() or None
+        notes        = self.txt_notes.get("1.0", tk.END).strip() or None
+        try:
+            duration = int(self.var_duration.get())
+            if duration < 1:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            duration = 30
+
+        try:
+            self.conn.execute(
+                "INSERT INTO templates "
+                "(name, language, activity_type, specific_activity, duration_minutes, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, language, activity_type, specific, duration, notes),
+            )
+            self.conn.commit()
+            self._refresh_templates()
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicate Name", f'A template named "{name}" already exists.')
+
+    def _apply_template(self, tid):
+        row = self.conn.execute(
+            "SELECT language, activity_type, specific_activity, duration_minutes, notes "
+            "FROM templates WHERE id=?", (tid,)
+        ).fetchone()
+        if not row:
+            return
+        lang, act, spec, dur, notes = row
+        if lang:
+            lang_name = LANGUAGES.get(lang, "")
+            self.var_language.set(f"{lang_name} ({lang})" if lang_name else lang)
+        else:
+            self.var_language.set("")
+        self.var_activity_type.set(act)
+        self._on_activity_type_change()
+        self.var_specific.set(spec or "")
+        self.var_duration.set(dur)
+        self.var_date.set(date.today().isoformat())
+        self.txt_notes.delete("1.0", tk.END)
+        if notes:
+            self.txt_notes.insert("1.0", notes)
+
+    def _delete_template(self, tid):
+        if messagebox.askyesno("Delete Template", "Delete this template?"):
+            self.conn.execute("DELETE FROM templates WHERE id=?", (tid,))
+            self.conn.commit()
+            self._refresh_templates()
+
+    def _refresh_templates(self):
+        for w in self.tmpl_inner.winfo_children():
+            w.destroy()
+        rows = self.conn.execute(
+            "SELECT id, name FROM templates ORDER BY name"
+        ).fetchall()
+        if not rows:
+            ttk.Label(
+                self.tmpl_inner, text="No templates saved yet.", foreground="gray"
+            ).pack(anchor=tk.W, padx=2, pady=2)
+            return
+        for tid, tname in rows:
+            row_f = ttk.Frame(self.tmpl_inner)
+            row_f.pack(fill=tk.X, pady=1)
+            row_f.columnconfigure(0, weight=1)
+            ttk.Button(
+                row_f, text=tname,
+                command=lambda t=tid: self._apply_template(t),
+            ).grid(row=0, column=0, sticky=tk.EW, padx=(0, 4))
+            ttk.Button(
+                row_f, text="×", width=2,
+                command=lambda t=tid: self._delete_template(t),
+            ).grid(row=0, column=1)
 
     # ------------------------------------------------------------------
     # Tab 2 — History
@@ -374,9 +487,10 @@ class LanguageLoggerApp(tk.Tk):
 
         self.tree.bind("<Double-1>", self._on_history_double_click)
 
-        ttk.Button(frame, text="Delete Selected", command=self.delete_session).grid(
-            row=3, column=0, sticky=tk.W, pady=(8, 0)
-        )
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+        ttk.Button(btn_row, text="Delete Selected", command=self.delete_session).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Export as CSV", command=self._export_csv).pack(side=tk.RIGHT)
 
         self._tree_id_map  = {}
         self._sort_column  = "date"
@@ -474,6 +588,55 @@ class LanguageLoggerApp(tk.Tk):
         self.var_hist_from.set("")
         self.var_hist_to.set("")
         self.load_history()
+
+    def _export_csv(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="sessions.csv",
+            title="Export sessions as CSV",
+        )
+        if not path:
+            return
+
+        # Reuse the same filter logic as load_history
+        conditions, params = [], []
+        lang_sel = self.var_hist_lang.get()
+        if lang_sel and lang_sel != "All":
+            conditions.append("language = ?")
+            params.append(_extract_lang_code(lang_sel))
+        act_sel = self.var_hist_act.get()
+        if act_sel and act_sel != "All":
+            conditions.append("activity_type = ?")
+            params.append(act_sel)
+        from_str = self.var_hist_from.get().strip()
+        to_str   = self.var_hist_to.get().strip()
+        if from_str:
+            conditions.append("date >= ?")
+            params.append(from_str)
+        if to_str:
+            conditions.append("date <= ?")
+            params.append(to_str)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        rows = self.conn.execute(
+            f"SELECT date, language, activity_type, specific_activity, duration_minutes, notes "
+            f"FROM sessions {where} ORDER BY date DESC",
+            params,
+        ).fetchall()
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Date", "Language", "Activity Type", "Specific Activity",
+                             "Duration (min)", "Notes"])
+            for date_val, lang, act, spec, dur, notes in rows:
+                if lang:
+                    lang_disp = f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang
+                else:
+                    lang_disp = ""
+                writer.writerow([date_val, lang_disp, act, spec or "", dur, notes or ""])
+
+        messagebox.showinfo("Export complete", f"Exported {len(rows)} session(s) to:\n{path}")
 
     def _on_history_double_click(self, event):
         item = self.tree.identify_row(event.y)
@@ -820,7 +983,237 @@ class LanguageLoggerApp(tk.Tk):
         self.canvas.draw()
 
     # ------------------------------------------------------------------
-    # Tab 4 — Settings
+    # Tab 4 — Cumulative
+    # ------------------------------------------------------------------
+
+    def _build_cumulative_tab(self):
+        frame = ttk.Frame(self.tab_cumulative, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.rowconfigure(2, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        # Filter bar (row 0) — mirrors Stats
+        flt = ttk.Frame(frame)
+        flt.grid(row=0, column=0, sticky=tk.EW, pady=(0, 4))
+
+        _lang_w = max(len(o) for o in LANGUAGE_OPTIONS)
+        ttk.Label(flt, text="Language:").pack(side=tk.LEFT)
+        self.var_cumul_lang = tk.StringVar(value="All")
+        self.cb_cumul_lang = ttk.Combobox(
+            flt, textvariable=self.var_cumul_lang,
+            values=["All"] + self._pref_languages(), width=_lang_w, state="readonly",
+        )
+        self.cb_cumul_lang.pack(side=tk.LEFT, padx=(4, 10))
+
+        eight_ago = (date.today() - timedelta(weeks=8)).isoformat()
+        ttk.Label(flt, text="From:").pack(side=tk.LEFT)
+        self.var_cumul_start = tk.StringVar(value=eight_ago)
+        ttk.Entry(flt, textvariable=self.var_cumul_start, width=11).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Label(flt, text="To:").pack(side=tk.LEFT)
+        self.var_cumul_end = tk.StringVar(value=date.today().isoformat())
+        ttk.Entry(flt, textvariable=self.var_cumul_end, width=11).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Label(flt, text="By:").pack(side=tk.LEFT)
+        self.var_cumul_groupby = tk.StringVar(value="Week")
+        ttk.Combobox(
+            flt, textvariable=self.var_cumul_groupby,
+            values=["Day", "Week", "Month"], width=6, state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Label(flt, text="Quick:").pack(side=tk.LEFT)
+        self.var_cumul_preset = tk.StringVar()
+        cb_cp = ttk.Combobox(
+            flt, textvariable=self.var_cumul_preset,
+            values=["Last week", "Last month", "Last 3 months", "Last 6 months", "Last year"],
+            width=13, state="readonly",
+        )
+        cb_cp.pack(side=tk.LEFT, padx=(4, 10))
+        cb_cp.bind("<<ComboboxSelected>>", self._apply_cumulative_preset)
+
+        ttk.Button(flt, text="Refresh", command=self.refresh_cumulative).pack(side=tk.LEFT)
+
+        # Summary bar (row 1)
+        self.var_cumul_summary = tk.StringVar(value="")
+        ttk.Label(
+            frame, textvariable=self.var_cumul_summary,
+            foreground="#555555", anchor=tk.W,
+        ).grid(row=1, column=0, sticky=tk.EW, padx=2, pady=(0, 4))
+
+        # Chart canvas (row 2)
+        self.fig_cumul = Figure(figsize=(8, 4), dpi=96)
+        self.fig_cumul.subplots_adjust(left=0.1, right=0.97, bottom=0.15, top=0.88)
+
+        self.canvas_cumul = FigureCanvasTkAgg(self.fig_cumul, master=frame)
+        self.canvas_cumul.get_tk_widget().grid(row=2, column=0, sticky=tk.NSEW)
+
+        toolbar_frame = ttk.Frame(frame)
+        toolbar_frame.grid(row=3, column=0, sticky=tk.EW)
+        NavigationToolbar2Tk(self.canvas_cumul, toolbar_frame)
+
+    def _apply_cumulative_preset(self, event=None):
+        preset = self.var_cumul_preset.get()
+        today  = date.today()
+
+        def months_ago(n):
+            year, month = today.year, today.month - n
+            while month <= 0:
+                month += 12
+                year  -= 1
+            try:
+                return date(year, month, today.day)
+            except ValueError:
+                return date(year, month + 1, 1) - timedelta(days=1)
+
+        starts = {
+            "Last week":     today - timedelta(weeks=1),
+            "Last month":    months_ago(1),
+            "Last 3 months": months_ago(3),
+            "Last 6 months": months_ago(6),
+            "Last year":     months_ago(12),
+        }
+        start = starts.get(preset)
+        if start:
+            self.var_cumul_start.set(start.isoformat())
+            self.var_cumul_end.set(today.isoformat())
+            self.refresh_cumulative()
+
+    def refresh_cumulative(self):
+        from collections import defaultdict
+
+        self.fig_cumul.clear()
+
+        lang_display = self.var_cumul_lang.get()
+        lang_code    = None if lang_display == "All" else _extract_lang_code(lang_display)
+        start_str    = self.var_cumul_start.get().strip()
+        end_str      = self.var_cumul_end.get().strip()
+        grouping     = self.var_cumul_groupby.get()
+
+        try:
+            start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
+            end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date() if end_str   else None
+        except ValueError:
+            messagebox.showerror("Invalid Date", "Dates must be in YYYY-MM-DD format.")
+            return
+
+        conditions, params = [], []
+        if lang_code:
+            conditions.append("language = ?")
+            params.append(lang_code)
+        if start_str:
+            conditions.append("date >= ?")
+            params.append(start_str)
+        if end_str:
+            conditions.append("date <= ?")
+            params.append(end_str)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = self.conn.execute(
+            f"SELECT date, activity_type, duration_minutes FROM sessions {where}", params
+        ).fetchall()
+
+        ax = self.fig_cumul.add_subplot(1, 1, 1)
+
+        if not rows:
+            self.var_cumul_summary.set("No data in the selected range.")
+            ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=12, color="gray")
+            ax.set_axis_off()
+            self.canvas_cumul.draw()
+            return
+
+        # ---- Summary ----
+        total_sessions = len(rows)
+        total_min      = sum(dur for _, _, dur in rows)
+        avg_min        = total_min / total_sessions
+        act_totals     = defaultdict(float)
+        for _, act, dur in rows:
+            act_totals[act] += dur
+        top_act = max(act_totals, key=act_totals.get)
+        self.var_cumul_summary.set(
+            f"Sessions: {total_sessions}   ·   "
+            f"Total: {_fmt_time(total_min)}   ·   "
+            f"Avg session: {_fmt_time(avg_min)}   ·   "
+            f"Top activity: {top_act}"
+        )
+
+        # ---- Consistent color mapping ----
+        all_acts  = sorted(set(act for _, act, _ in rows))
+        color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)]
+                     for i, act in enumerate(all_acts)}
+
+        # ---- Period helpers ----
+        def period_key(d_str):
+            d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            if grouping == "Day":   return d.isoformat()
+            if grouping == "Week":  return (d - timedelta(days=d.weekday())).isoformat()
+            return d_str[:7]
+
+        def all_periods(s, e):
+            result = []
+            if grouping == "Day":
+                d = s
+                while d <= e:
+                    result.append((d.isoformat(), d.strftime("%b %d")))
+                    d += timedelta(days=1)
+            elif grouping == "Week":
+                ws = s - timedelta(days=s.weekday())
+                while ws <= e:
+                    result.append((ws.isoformat(), ws.strftime("%b %d")))
+                    ws += timedelta(weeks=1)
+            else:
+                d = date(s.year, s.month, 1)
+                while d <= e:
+                    result.append((d.strftime("%Y-%m"), d.strftime("%b '%y")))
+                    nxt = d.month % 12 + 1
+                    d   = date(d.year + (1 if d.month == 12 else 0), nxt, 1)
+            return result
+
+        data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
+        eff_start  = start_date or min(data_dates)
+        eff_end    = end_date   or max(data_dates)
+        periods    = all_periods(eff_start, eff_end)
+        p_keys     = [p[0] for p in periods]
+        p_labels   = [p[1] for p in periods]
+
+        # ---- Accumulate per (activity, period) ----
+        by_act_period = defaultdict(lambda: defaultdict(float))
+        for d_str, act, dur in rows:
+            by_act_period[act][period_key(d_str)] += dur / 60
+
+        # ---- Build cumulative series per activity ----
+        cumul = {act: [] for act in all_acts}
+        running = {act: 0.0 for act in all_acts}
+        for k in p_keys:
+            for act in all_acts:
+                running[act] += by_act_period[act].get(k, 0.0)
+                cumul[act].append(running[act])
+
+        # ---- Stacked area chart ----
+        x = list(range(len(p_keys)))
+        ax.stackplot(
+            x,
+            [cumul[act] for act in all_acts],
+            labels=all_acts,
+            colors=[color_map[act] for act in all_acts],
+            alpha=0.85,
+        )
+
+        ax.set_xticks(x)
+        label_fs = max(5, min(8, 80 // max(len(p_keys), 1)))
+        ax.set_xticklabels(p_labels, rotation=40, ha="right", fontsize=label_fs)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda h, _: _fmt_time(h * 60)))
+        ax.set_ylabel("Cumulative Duration")
+        title = f"Cumulative Time per {grouping}"
+        if lang_display != "All":
+            title += f"  ({lang_display})"
+        ax.set_title(title, fontsize=10)
+        ax.legend(fontsize=7, loc="upper left", framealpha=0.7)
+
+        self.canvas_cumul.draw()
+
+    # ------------------------------------------------------------------
+    # Tab 5 — Settings
     # ------------------------------------------------------------------
 
     def _save_all_prefs(self):
