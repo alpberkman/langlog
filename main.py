@@ -244,6 +244,8 @@ class LanguageLoggerApp(tk.Tk):
         if act:
             specs = self._pref_specifics(act)
             self.cb_specific["values"] = specs
+        if hasattr(self, "cb_stats_lang"):
+            self.cb_stats_lang["values"] = ["All"] + self._pref_languages()
 
     def save_session(self):
         lang_display = self.var_language.get().strip()
@@ -381,27 +383,76 @@ class LanguageLoggerApp(tk.Tk):
     def _build_stats_tab(self):
         frame = ttk.Frame(self.tab_stats, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
+        # Filter bar (row 0)
+        filter_frame = ttk.Frame(frame)
+        filter_frame.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+
+        ttk.Label(filter_frame, text="Language:").pack(side=tk.LEFT)
+        self.var_stats_lang = tk.StringVar(value="All")
+        self.cb_stats_lang = ttk.Combobox(
+            filter_frame, textvariable=self.var_stats_lang,
+            values=["All"] + self._pref_languages(), width=22, state="readonly",
+        )
+        self.cb_stats_lang.pack(side=tk.LEFT, padx=(4, 16))
+
+        eight_ago = (date.today() - timedelta(weeks=8)).isoformat()
+        ttk.Label(filter_frame, text="From:").pack(side=tk.LEFT)
+        self.var_stats_start = tk.StringVar(value=eight_ago)
+        ttk.Entry(filter_frame, textvariable=self.var_stats_start, width=12).pack(
+            side=tk.LEFT, padx=(4, 16)
+        )
+
+        ttk.Label(filter_frame, text="To:").pack(side=tk.LEFT)
+        self.var_stats_end = tk.StringVar(value=date.today().isoformat())
+        ttk.Entry(filter_frame, textvariable=self.var_stats_end, width=12).pack(
+            side=tk.LEFT, padx=(4, 16)
+        )
+
+        ttk.Button(filter_frame, text="Refresh", command=self.refresh_stats).pack(side=tk.LEFT)
+
+        # Chart canvas (row 1)
         self.fig = Figure(figsize=(8, 4), dpi=96)
-        self.fig.subplots_adjust(left=0.08, right=0.95, bottom=0.15, top=0.88, wspace=0.35)
+        self.fig.subplots_adjust(left=0.08, right=0.95, bottom=0.15, top=0.88, wspace=0.4)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky=tk.NSEW)
 
         toolbar_frame = ttk.Frame(frame)
-        toolbar_frame.grid(row=1, column=0, sticky=tk.EW)
+        toolbar_frame.grid(row=2, column=0, sticky=tk.EW)
         NavigationToolbar2Tk(self.canvas, toolbar_frame)
-
-        ttk.Button(frame, text="Refresh", command=self.refresh_stats).grid(
-            row=2, column=0, sticky=tk.W, pady=(4, 0)
-        )
 
     def refresh_stats(self):
         self.fig.clear()
+
+        lang_display = self.var_stats_lang.get()
+        lang_code    = None if lang_display == "All" else _extract_lang_code(lang_display)
+        start_str    = self.var_stats_start.get().strip()
+        end_str      = self.var_stats_end.get().strip()
+
+        try:
+            start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
+            end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date() if end_str   else None
+        except ValueError:
+            messagebox.showerror("Invalid Date", "Dates must be in YYYY-MM-DD format.")
+            return
+
+        conditions, params = [], []
+        if lang_code:
+            conditions.append("language = ?")
+            params.append(lang_code)
+        if start_str:
+            conditions.append("date >= ?")
+            params.append(start_str)
+        if end_str:
+            conditions.append("date <= ?")
+            params.append(end_str)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         rows = self.conn.execute(
-            "SELECT date, activity_type, duration_minutes FROM sessions"
+            f"SELECT date, activity_type, duration_minutes FROM sessions {where}", params
         ).fetchall()
 
         ax_bar = self.fig.add_subplot(1, 2, 1)
@@ -415,40 +466,59 @@ class LanguageLoggerApp(tk.Tk):
             self.canvas.draw()
             return
 
+        # ---- Bar chart: hours per week within the selected date range ----
         today = date.today()
+        effective_end = end_date or today
+        if start_date:
+            ws = start_date - timedelta(days=start_date.weekday())
+        else:
+            ws = today - timedelta(days=today.weekday() + 7 * 7)
+
         weeks, week_hours = [], []
-        for i in range(7, -1, -1):
-            week_start = today - timedelta(days=today.weekday() + 7 * i)
-            week_end   = week_start + timedelta(days=6)
-            label      = week_start.strftime("%b %d")
-            total_min  = sum(
+        while ws <= effective_end:
+            we    = ws + timedelta(days=6)
+            total = sum(
                 dur for d, _, dur in rows
-                if week_start.isoformat() <= d <= week_end.isoformat()
+                if ws.isoformat() <= d <= we.isoformat()
             )
-            weeks.append(label)
-            week_hours.append(round(total_min / 60, 2))
+            weeks.append(ws.strftime("%b %d"))
+            week_hours.append(round(total / 60, 2))
+            ws += timedelta(weeks=1)
 
         bars = ax_bar.bar(range(len(weeks)), week_hours, color="#4a90d9")
         ax_bar.set_xticks(range(len(weeks)))
-        ax_bar.set_xticklabels(weeks, rotation=40, ha="right", fontsize=7)
+        label_fs = max(5, min(8, 80 // max(len(weeks), 1)))
+        ax_bar.set_xticklabels(weeks, rotation=40, ha="right", fontsize=label_fs)
         ax_bar.set_ylabel("Hours")
-        ax_bar.set_title("Hours per Week (last 8 weeks)")
+        bar_title = "Hours per Week"
+        if lang_display != "All":
+            bar_title += f"\n({lang_display})"
+        ax_bar.set_title(bar_title, fontsize=9)
         for bar, val in zip(bars, week_hours):
             if val > 0:
                 ax_bar.text(
                     bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 0.01,
-                    f"{val:.1f}", ha="center", va="bottom", fontsize=7,
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=6,
                 )
 
+        # ---- Pie chart: activity breakdown with % and hours in each slice ----
         from collections import defaultdict
-        by_activity = defaultdict(int)
+        by_act   = defaultdict(int)
         for _, act, dur in rows:
-            by_activity[act] += dur
-        labels = list(by_activity.keys())
-        sizes  = [by_activity[l] for l in labels]
-        ax_pie.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=140)
-        ax_pie.set_title("Time by Activity Type")
+            by_act[act] += dur
+        pie_labels = list(by_act.keys())
+        sizes      = [by_act[l] for l in pie_labels]
+        total_min  = sum(sizes)
+
+        def _autopct(pct):
+            h = pct * total_min / 100 / 60
+            return f"{pct:.1f}%\n{h:.1f}h"
+
+        ax_pie.pie(sizes, labels=pie_labels, autopct=_autopct, startangle=140,
+                   textprops={"fontsize": 7})
+        total_h = round(total_min / 60, 1)
+        ax_pie.set_title(f"Activity Breakdown  ·  Total: {total_h}h", fontsize=9)
 
         self.canvas.draw()
 
