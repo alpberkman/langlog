@@ -312,14 +312,48 @@ class LanguageLoggerApp(tk.Tk):
         frame = ttk.Frame(self.tab_history, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
 
+        # Filter bar (row 0)
+        fbar = ttk.Frame(frame)
+        fbar.grid(row=0, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+
+        ttk.Label(fbar, text="Language:").pack(side=tk.LEFT)
+        self.var_hist_lang = tk.StringVar(value="All")
+        self.cb_hist_lang = ttk.Combobox(
+            fbar, textvariable=self.var_hist_lang, values=["All"],
+            width=20, state="readonly",
+        )
+        self.cb_hist_lang.pack(side=tk.LEFT, padx=(4, 12))
+        self.cb_hist_lang.bind("<<ComboboxSelected>>", lambda e: self.load_history())
+
+        ttk.Label(fbar, text="Activity:").pack(side=tk.LEFT)
+        self.var_hist_act = tk.StringVar(value="All")
+        self.cb_hist_act = ttk.Combobox(
+            fbar, textvariable=self.var_hist_act, values=["All"],
+            width=14, state="readonly",
+        )
+        self.cb_hist_act.pack(side=tk.LEFT, padx=(4, 12))
+        self.cb_hist_act.bind("<<ComboboxSelected>>", lambda e: self.load_history())
+
+        ttk.Label(fbar, text="From:").pack(side=tk.LEFT)
+        self.var_hist_from = tk.StringVar()
+        ttk.Entry(fbar, textvariable=self.var_hist_from, width=11).pack(side=tk.LEFT, padx=(4, 6))
+
+        ttk.Label(fbar, text="To:").pack(side=tk.LEFT)
+        self.var_hist_to = tk.StringVar()
+        ttk.Entry(fbar, textvariable=self.var_hist_to, width=11).pack(side=tk.LEFT, padx=(4, 10))
+
+        ttk.Button(fbar, text="Apply", command=self.load_history).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(fbar, text="Clear", command=self._clear_history_filter).pack(side=tk.LEFT)
+
+        # Treeview (row 1)
         columns = ("date", "language", "activity", "specific", "duration", "notes")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
 
         col_cfg = [
             ("date",     "Date",              100),
-            ("language", "Language",          90),
+            ("language", "Language",          140),
             ("activity", "Activity Type",     120),
             ("specific", "Specific Activity", 140),
             ("duration", "Duration (min)",    110),
@@ -334,32 +368,73 @@ class LanguageLoggerApp(tk.Tk):
         hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        self.tree.grid(row=0, column=0, sticky=tk.NSEW)
-        vsb.grid(row=0, column=1, sticky=tk.NS)
-        hsb.grid(row=1, column=0, sticky=tk.EW)
+        self.tree.grid(row=1, column=0, sticky=tk.NSEW)
+        vsb.grid(row=1, column=1, sticky=tk.NS)
+        hsb.grid(row=2, column=0, sticky=tk.EW)
+
+        self.tree.bind("<Double-1>", self._on_history_double_click)
 
         ttk.Button(frame, text="Delete Selected", command=self.delete_session).grid(
-            row=2, column=0, sticky=tk.W, pady=(8, 0)
+            row=3, column=0, sticky=tk.W, pady=(8, 0)
         )
 
-        self._tree_id_map   = {}
-        self._sort_column   = "date"
-        self._sort_reverse  = True
+        self._tree_id_map  = {}
+        self._sort_column  = "date"
+        self._sort_reverse = True
 
     def load_history(self):
+        # Refresh filter dropdown options from actual DB data
+        lang_codes = [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT language FROM sessions WHERE language IS NOT NULL ORDER BY language"
+        ).fetchall()]
+        lang_opts = ["All"] + [
+            (f"{LANGUAGES[c]} ({c})" if c in LANGUAGES else c) for c in lang_codes
+        ]
+        self.cb_hist_lang["values"] = lang_opts
+
+        act_opts = ["All"] + [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT activity_type FROM sessions ORDER BY activity_type"
+        ).fetchall()]
+        self.cb_hist_act["values"] = act_opts
+
+        # Build WHERE clause from active filters
+        conditions, params = [], []
+        lang_sel = self.var_hist_lang.get()
+        if lang_sel and lang_sel != "All":
+            conditions.append("language = ?")
+            params.append(_extract_lang_code(lang_sel))
+        act_sel = self.var_hist_act.get()
+        if act_sel and act_sel != "All":
+            conditions.append("activity_type = ?")
+            params.append(act_sel)
+        from_str = self.var_hist_from.get().strip()
+        to_str   = self.var_hist_to.get().strip()
+        if from_str:
+            conditions.append("date >= ?")
+            params.append(from_str)
+        if to_str:
+            conditions.append("date <= ?")
+            params.append(to_str)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._tree_id_map.clear()
 
         cur = self.conn.execute(
-            "SELECT id, date, language, activity_type, specific_activity, duration_minutes, notes "
-            "FROM sessions ORDER BY date DESC"
+            f"SELECT id, date, language, activity_type, specific_activity, duration_minutes, notes "
+            f"FROM sessions {where} ORDER BY date DESC",
+            params,
         )
         for row in cur.fetchall():
             db_id, date_val, lang, act, spec, dur, notes = row
+            if lang:
+                lang_disp = f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang
+            else:
+                lang_disp = ""
             iid = self.tree.insert(
                 "", tk.END,
-                values=(date_val, lang or "", act, spec or "", dur, notes or ""),
+                values=(date_val, lang_disp, act, spec or "", dur, notes or ""),
             )
             self._tree_id_map[iid] = db_id
 
@@ -392,6 +467,133 @@ class LanguageLoggerApp(tk.Tk):
 
         for index, (_, iid) in enumerate(items):
             self.tree.move(iid, "", index)
+
+    def _clear_history_filter(self):
+        self.var_hist_lang.set("All")
+        self.var_hist_act.set("All")
+        self.var_hist_from.set("")
+        self.var_hist_to.set("")
+        self.load_history()
+
+    def _on_history_double_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        db_id = self._tree_id_map.get(item)
+        if db_id is not None:
+            self._open_edit_dialog(db_id)
+
+    def _open_edit_dialog(self, db_id):
+        row = self.conn.execute(
+            "SELECT language, activity_type, specific_activity, duration_minutes, date, notes "
+            "FROM sessions WHERE id=?", (db_id,)
+        ).fetchone()
+        if not row:
+            return
+        lang_code, act_type, spec_act, duration, date_str, notes = row
+
+        lang_display = ""
+        if lang_code:
+            name = LANGUAGES.get(lang_code, "")
+            lang_display = f"{name} ({lang_code})" if name else lang_code
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Edit Session")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+
+        frame = ttk.Frame(dlg, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        def lbl(text, r):
+            ttk.Label(frame, text=text).grid(
+                row=r, column=0, sticky=tk.W, pady=6, padx=(0, 12)
+            )
+
+        lbl("Language:", 0)
+        var_lang = tk.StringVar(value=lang_display)
+        cb_lang = ttk.Combobox(frame, textvariable=var_lang, width=28)
+        cb_lang["values"] = self._pref_languages()
+        cb_lang.grid(row=0, column=1, sticky=tk.EW)
+
+        lbl("Activity Type:", 1)
+        var_act = tk.StringVar(value=act_type or "")
+        cb_act = ttk.Combobox(
+            frame, textvariable=var_act,
+            values=self._pref_activity_types(), state="readonly", width=28,
+        )
+        cb_act.grid(row=1, column=1, sticky=tk.EW)
+
+        lbl("Specific Activity:", 2)
+        var_spec = tk.StringVar(value=spec_act or "")
+        cb_spec = ttk.Combobox(frame, textvariable=var_spec, width=28)
+        cb_spec["values"] = self._pref_specifics(act_type) if act_type else []
+        cb_spec.grid(row=2, column=1, sticky=tk.EW)
+        cb_act.bind("<<ComboboxSelected>>",
+                    lambda e: cb_spec.configure(values=self._pref_specifics(var_act.get())))
+
+        lbl("Duration (min):", 3)
+        var_dur = tk.StringVar(value=str(duration))
+        ttk.Spinbox(
+            frame, from_=1, to=600, increment=5, textvariable=var_dur, width=10
+        ).grid(row=3, column=1, sticky=tk.W)
+
+        lbl("Date (YYYY-MM-DD):", 4)
+        var_date = tk.StringVar(value=date_str)
+        ttk.Entry(frame, textvariable=var_date, width=14).grid(row=4, column=1, sticky=tk.W)
+
+        lbl("Notes:", 5)
+        txt_notes = tk.Text(frame, height=3, width=34, wrap=tk.WORD)
+        if notes:
+            txt_notes.insert("1.0", notes)
+        txt_notes.grid(row=5, column=1, sticky=tk.EW, pady=(0, 4))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=6, column=0, columnspan=2, sticky=tk.E, pady=(12, 0))
+        ttk.Button(
+            btn_frame, text="Update",
+            command=lambda: self._update_session(
+                db_id, dlg, var_lang, var_act, var_spec, var_dur, var_date, txt_notes
+            ),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="Abort", command=dlg.destroy).pack(side=tk.LEFT)
+
+        dlg.update_idletasks()
+        dlg.minsize(dlg.winfo_reqwidth(), dlg.winfo_reqheight())
+        dlg.grab_set()
+
+    def _update_session(self, db_id, dlg, var_lang, var_act, var_spec, var_dur, var_date, txt_notes):
+        lang_display  = var_lang.get().strip()
+        language      = _extract_lang_code(lang_display) if lang_display else None
+        activity_type = var_act.get().strip()
+        specific      = var_spec.get().strip() or None
+        notes         = txt_notes.get("1.0", tk.END).strip() or None
+
+        if not activity_type:
+            messagebox.showerror("Validation Error", "Activity Type is required.", parent=dlg)
+            return
+        try:
+            duration = int(float(var_dur.get()))
+            if duration < 1:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Validation Error", "Duration must be a positive integer.", parent=dlg)
+            return
+        try:
+            datetime.strptime(var_date.get().strip(), "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Validation Error", "Date must be in YYYY-MM-DD format.", parent=dlg)
+            return
+
+        self.conn.execute(
+            "UPDATE sessions SET language=?, activity_type=?, specific_activity=?, "
+            "duration_minutes=?, date=?, notes=? WHERE id=?",
+            (language, activity_type, specific, duration, var_date.get().strip(), notes, db_id),
+        )
+        self.conn.commit()
+        dlg.destroy()
+        self.load_history()
 
     # ------------------------------------------------------------------
     # Tab 3 — Stats
