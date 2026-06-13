@@ -528,11 +528,41 @@ class LogTab(ttk.Frame):
             row=7, column=0, columnspan=3, sticky=tk.EW, pady=(14, 0)
         )
         tmpl_lf = ttk.LabelFrame(frame, text=" Saved Templates ", padding=(8, 6))
-        tmpl_lf.grid(row=8, column=0, columnspan=3, sticky=tk.NSEW, pady=(4, 0))
+        tmpl_lf.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
         tmpl_lf.columnconfigure(0, weight=1)
-        self.tmpl_inner = ttk.Frame(tmpl_lf)
-        self.tmpl_inner.pack(fill=tk.BOTH, expand=True)
+
+        self.tmpl_canvas = tk.Canvas(tmpl_lf, highlightthickness=0, height=180)
+        tmpl_vsb = ttk.Scrollbar(tmpl_lf, orient=tk.VERTICAL, command=self.tmpl_canvas.yview)
+        self.tmpl_canvas.configure(yscrollcommand=tmpl_vsb.set)
+        self.tmpl_canvas.grid(row=0, column=0, sticky=tk.NSEW)
+        tmpl_vsb.grid(row=0, column=1, sticky=tk.NS)
+
+        self.tmpl_inner = ttk.Frame(self.tmpl_canvas)
+        self._tmpl_win = self.tmpl_canvas.create_window((0, 0), window=self.tmpl_inner, anchor=tk.NW)
+
+        self.tmpl_inner.bind("<Configure>", lambda e: self.tmpl_canvas.configure(
+            scrollregion=self.tmpl_canvas.bbox("all")))
+        self.tmpl_canvas.bind("<Configure>", lambda e: self.tmpl_canvas.itemconfig(
+            self._tmpl_win, width=e.width))
+        self.tmpl_canvas.bind("<MouseWheel>", self._tmpl_scroll)
+        self.tmpl_canvas.bind("<Button-4>",   self._tmpl_scroll)
+        self.tmpl_canvas.bind("<Button-5>",   self._tmpl_scroll)
         self._refresh_templates()
+
+    def _tmpl_scroll(self, event):
+        if event.num == 4:
+            self.tmpl_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.tmpl_canvas.yview_scroll(1, "units")
+        else:
+            self.tmpl_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_tmpl_scroll(self, widget):
+        widget.bind("<MouseWheel>", self._tmpl_scroll)
+        widget.bind("<Button-4>",   self._tmpl_scroll)
+        widget.bind("<Button-5>",   self._tmpl_scroll)
+        for child in widget.winfo_children():
+            self._bind_tmpl_scroll(child)
 
     def _on_activity_type_change(self, event=None):
         activity  = self.var_activity_type.get()
@@ -650,6 +680,7 @@ class LogTab(ttk.Frame):
             ttk.Button(row_f, text="×", width=2, command=lambda t=tid: self._delete_template(t)).grid(
                 row=0, column=1
             )
+        self._bind_tmpl_scroll(self.tmpl_inner)
 
 
 # ---------------------------------------------------------------------------
@@ -1387,7 +1418,14 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook.add(self.tab_settings, text="  Settings  ")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
-        self.bind("<Control-s>", lambda e: self.tab_log.save_session())
+        self.bind("<Control-s>", self._on_ctrl_s)
+
+    def _on_ctrl_s(self, event=None):
+        selected = self.notebook.select()
+        if selected == str(self.tab_log):
+            self.tab_log.save_session()
+        elif selected == str(self.tab_settings):
+            self.tab_settings._save_all()
 
     def _on_prefs_changed(self):
         self.tab_log.refresh_prefs()
