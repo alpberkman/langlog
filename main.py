@@ -6,17 +6,31 @@ import sqlite3
 import csv
 import os
 import sys
+import argparse
 import threading
 import time
 import calendar
 from collections import defaultdict, namedtuple
 from datetime import date, timedelta, datetime
 
-DB_PATH = (
-    sys.argv[1]
-    if len(sys.argv) > 1
-    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
-)
+_DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+
+def _parse_args():
+    p = argparse.ArgumentParser(description="Language Learning Logger")
+    p.add_argument("-f", "--db", default=_DEFAULT_DB, metavar="PATH",
+                   help="Path to the SQLite database (default: sessions.db next to this script)")
+    p.add_argument("-t", "--template", metavar="NAME",
+                   help="Log a session using this template name and exit without opening the GUI")
+    p.add_argument("-d", "--date", metavar="YYYY-MM-DD", default=date.today().isoformat(),
+                   help="Date for the session (default: today)")
+    p.add_argument("-m", "--duration", metavar="MINUTES", type=int,
+                   help="Override the template's duration (minutes)")
+    p.add_argument("-l", "--list-templates", action="store_true",
+                   help="Print all saved template names and exit")
+    return p.parse_args()
+
+_ARGS = _parse_args()
+DB_PATH = _ARGS.db
 
 LANGUAGES = {
     "af": "Afrikaans", "sq": "Albanian",  "ar": "Arabic",     "hy": "Armenian",
@@ -381,6 +395,12 @@ class Database:
         return self.conn.execute(
             "SELECT language, activity_type, specific_activity, duration_minutes, notes "
             "FROM templates WHERE id=?", (template_id,)
+        ).fetchone()
+
+    def get_template_by_name(self, name: str) -> tuple | None:
+        return self.conn.execute(
+            "SELECT language, activity_type, specific_activity, duration_minutes, notes "
+            "FROM templates WHERE name=?", (name,)
         ).fetchone()
 
     def insert_template(self, name, language, activity_type, specific, duration, notes):
@@ -1812,6 +1832,57 @@ class LanguageLoggerApp(tk.Tk):
             self.tab_cumul.refresh()
 
 
+def _cli_list_templates():
+    db = Database(DB_PATH)
+    rows = db.get_templates()
+    if not rows:
+        print("No templates saved yet.")
+        return
+    for tid, tname in rows:
+        row = db.get_template(tid)
+        lang, act, spec, dur, notes = row
+        lang_display = _lang_display(lang) if lang else "(no language)"
+        detail = f"{lang_display} | {act}"
+        if spec:
+            detail += f" / {spec}"
+        detail += f" | {dur} min"
+        print(f"{tname}: {detail}")
+
+
+def _cli_log():
+    """Log a session from CLI args and exit, no GUI."""
+    try:
+        datetime.strptime(_ARGS.date, "%Y-%m-%d")
+    except ValueError:
+        sys.exit(f"Error: --date must be YYYY-MM-DD, got {_ARGS.date!r}")
+
+    db = Database(DB_PATH)
+    row = db.get_template_by_name(_ARGS.template)
+    if row is None:
+        names = [r[1] for r in db.get_templates()]
+        if names:
+            sys.exit(f"Error: template {_ARGS.template!r} not found. Available: {', '.join(names)}")
+        else:
+            sys.exit(f"Error: template {_ARGS.template!r} not found. No templates saved yet.")
+
+    language, activity_type, specific, duration, notes = row
+    if _ARGS.duration is not None:
+        if _ARGS.duration < 1:
+            sys.exit("Error: --duration must be a positive integer")
+        duration = _ARGS.duration
+
+    db.insert_session(language, activity_type, specific, duration, _ARGS.date, notes)
+    lang_display = _lang_display(language) if language else "(no language)"
+    print(f"Logged: {lang_display} | {activity_type}"
+          + (f" / {specific}" if specific else "")
+          + f" | {duration} min | {_ARGS.date}")
+
+
 if __name__ == "__main__":
-    app = LanguageLoggerApp()
-    app.mainloop()
+    if _ARGS.list_templates:
+        _cli_list_templates()
+    elif _ARGS.template:
+        _cli_log()
+    else:
+        app = LanguageLoggerApp()
+        app.mainloop()
