@@ -242,9 +242,12 @@ class Database:
 
     def _build_where(self, lang_code=None, activity=None, start=None, end=None):
         conditions, params = [], []
-        if lang_code:
-            conditions.append("language = ?")
-            params.append(lang_code)
+        if lang_code is not None:
+            if lang_code == "":
+                conditions.append("(language IS NULL OR language = '')")
+            else:
+                conditions.append("language = ?")
+                params.append(lang_code)
         if activity:
             conditions.append("activity_type = ?")
             params.append(activity)
@@ -385,7 +388,7 @@ class FilterBar(ttk.Frame):
         self.var_lang = tk.StringVar(value="All")
         self.cb_lang = ttk.Combobox(
             self, textvariable=self.var_lang,
-            values=["All"] + self.db.pref_languages(), width=_lang_w, state="readonly",
+            values=["All", "(No language)"] + self.db.pref_languages(), width=_lang_w, state="readonly",
         )
         self.cb_lang.pack(side=tk.LEFT, padx=(4, 10))
 
@@ -434,12 +437,16 @@ class FilterBar(ttk.Frame):
             self._on_refresh()
 
     def refresh_lang_options(self):
-        self.cb_lang["values"] = ["All"] + self.db.pref_languages()
+        self.cb_lang["values"] = ["All", "(No language)"] + self.db.pref_languages()
 
     @property
     def lang_code(self):
         v = self.var_lang.get()
-        return None if v == "All" else _extract_lang_code(v)
+        if v == "All":
+            return None
+        if v == "(No language)":
+            return ""
+        return _extract_lang_code(v)
 
     @property
     def lang_display(self):
