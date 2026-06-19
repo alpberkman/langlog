@@ -459,6 +459,136 @@ class FilterBar(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# Date picker popup
+# ---------------------------------------------------------------------------
+
+class DatePickerPopup(tk.Toplevel):
+    def __init__(self, anchor_widget, var: tk.StringVar):
+        root = anchor_widget.winfo_toplevel()
+        super().__init__(root)
+        self.var   = var
+        self._app_root = root
+        self.overrideredirect(True)
+        self.resizable(False, False)
+
+        try:
+            cur = datetime.strptime(var.get(), "%Y-%m-%d").date()
+        except ValueError:
+            cur = date.today()
+        self.year  = cur.year
+        self.month = cur.month
+        self._sel  = cur
+
+        self._build()
+        self._draw_days()
+
+        self.update_idletasks()
+        x = anchor_widget.winfo_rootx()
+        y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 2
+        self.geometry(f"+{x}+{y}")
+
+        self.focus_set()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._bind_id = root.bind("<ButtonPress>", self._outside_click, add=True)
+
+    def _outside_click(self, event):
+        # Walk up from the clicked widget — if we find this popup, click was inside
+        w = event.widget
+        while w is not None:
+            if w is self:
+                return
+            try:
+                w = w.master
+            except AttributeError:
+                break
+        self.destroy()
+
+    def destroy(self):
+        try:
+            self._app_root.unbind("<ButtonPress>", self._bind_id)
+        except Exception:
+            pass
+        super().destroy()
+
+    def _build(self):
+        outer = ttk.Frame(self, relief="solid", borderwidth=1)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # Month row
+        month_nav = ttk.Frame(outer, padding=(6, 6, 6, 2))
+        month_nav.pack(fill=tk.X)
+        ttk.Button(month_nav, text="◀", width=2, command=self._prev_month).pack(side=tk.LEFT)
+        ttk.Button(month_nav, text="▶", width=2, command=self._next_month).pack(side=tk.RIGHT)
+        self.lbl_month = ttk.Label(month_nav, anchor=tk.CENTER, font=("", 10, "bold"))
+        self.lbl_month.pack(side=tk.LEFT, expand=True)
+
+        # Year row
+        year_nav = ttk.Frame(outer, padding=(6, 0, 6, 4))
+        year_nav.pack(fill=tk.X)
+        ttk.Button(year_nav, text="◀", width=2, command=self._prev_year).pack(side=tk.LEFT)
+        ttk.Button(year_nav, text="▶", width=2, command=self._next_year).pack(side=tk.RIGHT)
+        self.lbl_year = ttk.Label(year_nav, anchor=tk.CENTER)
+        self.lbl_year.pack(side=tk.LEFT, expand=True)
+
+        dow = ttk.Frame(outer, padding=(6, 0))
+        dow.pack(fill=tk.X)
+        for i, d in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
+            ttk.Label(dow, text=d, width=3, anchor=tk.CENTER).grid(row=0, column=i, padx=1)
+
+        self.day_frame = ttk.Frame(outer, padding=(6, 2, 6, 4))
+        self.day_frame.pack()
+
+        # Today button
+        ttk.Button(outer, text="Today", command=self._select_today).pack(pady=(0, 6))
+
+    def _draw_days(self):
+        import calendar as _cal
+        for w in self.day_frame.winfo_children():
+            w.destroy()
+        self.lbl_month.config(text=_cal.month_name[self.month])
+        self.lbl_year.config(text=str(self.year))
+        for r, week in enumerate(_cal.monthcalendar(self.year, self.month)):
+            for c, day in enumerate(week):
+                if day == 0:
+                    ttk.Label(self.day_frame, text="", width=3).grid(row=r, column=c)
+                else:
+                    btn = ttk.Button(
+                        self.day_frame, text=str(day), width=3,
+                        command=lambda d=date(self.year, self.month, day): self._select(d),
+                    )
+                    btn.grid(row=r, column=c, padx=1, pady=1)
+
+    def _select(self, d: date):
+        self.var.set(d.isoformat())
+        self.destroy()
+
+    def _select_today(self):
+        self._select(date.today())
+
+    def _prev_month(self):
+        if self.month == 1:
+            self.month, self.year = 12, self.year - 1
+        else:
+            self.month -= 1
+        self._draw_days()
+
+    def _next_month(self):
+        if self.month == 12:
+            self.month, self.year = 1, self.year + 1
+        else:
+            self.month += 1
+        self._draw_days()
+
+    def _prev_year(self):
+        self.year -= 1
+        self._draw_days()
+
+    def _next_year(self):
+        self.year += 1
+        self._draw_days()
+
+
+# ---------------------------------------------------------------------------
 # Tab 1 — Log Session
 # ---------------------------------------------------------------------------
 
@@ -506,9 +636,16 @@ class LogTab(ttk.Frame):
             textvariable=self.var_duration, width=10,
         ).grid(row=3, column=1, sticky=tk.W)
 
-        lbl("Date (YYYY-MM-DD):", 4)
+        lbl("Date:", 4)
         self.var_date = tk.StringVar(value=date.today().isoformat())
-        ttk.Entry(frame, textvariable=self.var_date, width=14).grid(row=4, column=1, sticky=tk.W)
+        date_row = ttk.Frame(frame)
+        date_row.grid(row=4, column=1, sticky=tk.W)
+        ttk.Button(date_row, text="◀", width=2, command=lambda: self._shift_date(-1)).pack(side=tk.LEFT)
+        self._date_entry = ttk.Entry(date_row, textvariable=self.var_date, width=12)
+        self._date_entry.pack(side=tk.LEFT, padx=2)
+        ttk.Button(date_row, text="▶", width=2, command=lambda: self._shift_date(1)).pack(side=tk.LEFT)
+        ttk.Button(date_row, text="▼", width=2,
+                   command=lambda: DatePickerPopup(self._date_entry, self.var_date)).pack(side=tk.LEFT, padx=(4, 0))
 
         lbl("Notes:", 5)
         self.txt_notes = tk.Text(frame, height=4, width=40, wrap=tk.WORD)
@@ -567,6 +704,13 @@ class LogTab(ttk.Frame):
         specifics = self.db.pref_specifics(activity)
         self.cb_specific["values"] = specifics
         self.var_specific.set(specifics[0] if specifics else "")
+
+    def _shift_date(self, days: int):
+        try:
+            d = datetime.strptime(self.var_date.get().strip(), "%Y-%m-%d").date()
+            self.var_date.set((d + timedelta(days=days)).isoformat())
+        except ValueError:
+            pass
 
     def refresh_prefs(self):
         self.cb_language["values"]     = self.db.pref_languages()
