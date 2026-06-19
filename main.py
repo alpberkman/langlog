@@ -13,7 +13,7 @@ import calendar
 from collections import defaultdict, namedtuple
 from datetime import date, timedelta, datetime
 
-_DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.db")
+_DEFAULT_DB = os.path.join(os.path.expanduser("~"), ".config", "utils", "db", "langlog.db")
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Language Learning Logger")
@@ -210,6 +210,7 @@ def _build_mpl_frame(parent, canvas_row: int, **adjust_kw):
 
 class Database:
     def __init__(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         self.conn = sqlite3.connect(path)
         self._init_schema()
         self._seed_prefs()
