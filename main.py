@@ -7,6 +7,7 @@ import csv
 import os
 import sys
 import threading
+import time
 from collections import defaultdict
 from datetime import date, timedelta, datetime
 
@@ -728,6 +729,10 @@ class LogTab(ttk.Frame):
 
     def save_session(self):
         lang_display  = self.var_language.get().strip()
+        if lang_display and lang_display not in self.db.pref_languages():
+            messagebox.showerror("Validation Error",
+                "Language must be selected from the dropdown list or left empty.")
+            return
         language      = _extract_lang_code(lang_display) if lang_display else None
         activity_type = self.var_activity_type.get().strip()
         specific      = self.var_specific.get().strip() or None
@@ -1087,6 +1092,10 @@ class HistoryTab(ttk.Frame):
 
     def _update_session(self, db_id, dlg, var_lang, var_act, var_spec, var_dur, var_date, txt_notes):
         lang_display  = var_lang.get().strip()
+        if lang_display and lang_display not in self.db.pref_languages():
+            messagebox.showerror("Validation Error",
+                "Language must be selected from the dropdown list or left empty.", parent=dlg)
+            return
         language      = _extract_lang_code(lang_display) if lang_display else None
         activity_type = var_act.get().strip()
         specific      = var_spec.get().strip() or None
@@ -1588,6 +1597,111 @@ def _preload_matplotlib():
     from matplotlib.ticker import FuncFormatter  # noqa: F401
 
 
+class TimerTab(ttk.Frame):
+    def __init__(self, parent, log_tab: "LogTab"):
+        super().__init__(parent)
+        self._log_tab    = log_tab
+        self._running    = False
+        self._elapsed    = 0        # accumulated seconds before current run
+        self._tick_start = 0.0      # monotonic time when last started/resumed
+        self._after_id   = None
+        self._build()
+
+    def _build(self):
+        outer = ttk.Frame(self, padding=40)
+        outer.pack(expand=True)
+
+        self.lbl_time = tk.Label(outer, text="00:00", font=("", 64, "bold"))
+        self.lbl_time.pack(pady=(0, 8))
+
+        self.lbl_status = ttk.Label(outer, text="Ready", foreground="gray")
+        self.lbl_status.pack(pady=(0, 24))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack()
+
+        self.btn_startstop = ttk.Button(btn_row, text="Start", width=10,
+                                        command=self._toggle)
+        self.btn_startstop.pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(btn_row, text="Cancel", width=10,
+                   command=self._cancel).pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(btn_row, text="Finish", width=10,
+                   command=self._finish).pack(side=tk.LEFT, padx=6)
+
+    # ------------------------------------------------------------------
+    def _total_seconds(self) -> int:
+        if self._running:
+            return self._elapsed + int(time.monotonic() - self._tick_start)
+        return self._elapsed
+
+    def _fmt(self, seconds: int) -> str:
+        h, rem = divmod(seconds, 3600)
+        m, s   = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _tick(self):
+        self.lbl_time.config(text=self._fmt(self._total_seconds()))
+        if self._running:
+            self._after_id = self.after(1000, self._tick)
+
+    def _toggle(self):
+        if self._running:
+            # pause
+            self._elapsed += int(time.monotonic() - self._tick_start)
+            self._running  = False
+            if self._after_id:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+            self.btn_startstop.config(text="Resume")
+            self.lbl_status.config(text="Paused")
+        else:
+            # start / resume
+            self._tick_start = time.monotonic()
+            self._running    = True
+            self.btn_startstop.config(text="Pause")
+            self.lbl_status.config(text="Running…")
+            self._tick()
+
+    def _cancel(self):
+        if self._running:
+            if self._after_id:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+            self._running = False
+        self._elapsed = 0
+        self.lbl_time.config(text="00:00")
+        self.btn_startstop.config(text="Start")
+        self.lbl_status.config(text="Ready")
+
+    def _finish(self):
+        if self._running:
+            self._elapsed += int(time.monotonic() - self._tick_start)
+            self._running  = False
+            if self._after_id:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+
+        total = self._elapsed
+        if total < 30:
+            messagebox.showwarning("Timer", "Less than 30 seconds elapsed — nothing saved.")
+            return
+
+        minutes = max(1, round(total / 60))
+        self._log_tab.var_duration.set(minutes)
+
+        # switch to Log Session tab
+        nb = self.master
+        if isinstance(nb, ttk.Notebook):
+            nb.select(self._log_tab)
+
+        self._cancel()
+        messagebox.showinfo("Timer", f"Duration set to {minutes} minute{'s' if minutes != 1 else ''} in Log Session.")
+
+
 class LanguageLoggerApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1601,6 +1715,7 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         self.tab_log      = LogTab(self.notebook, db)
+        self.tab_timer    = TimerTab(self.notebook, self.tab_log)
         self.tab_history  = HistoryTab(self.notebook, db)
         self.tab_stats    = StatsTab(self.notebook, db)
         self.tab_cumul    = CumulativeTab(self.notebook, db)
@@ -1611,6 +1726,7 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook.add(self.tab_stats,    text="  Stats  ")
         self.notebook.add(self.tab_cumul,    text="  Cumulative  ")
         self.notebook.add(self.tab_settings, text="  Settings  ")
+        self.notebook.add(self.tab_timer,    text="  Timer  ")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
         self.bind("<Control-s>", self._on_ctrl_s)
