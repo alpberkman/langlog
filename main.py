@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, messagebox, filedialog, simpledialog, colorchooser
 import sqlite3
 import csv
 import os
 import sys
 import threading
 import time
-from collections import defaultdict
+import calendar
+from collections import defaultdict, namedtuple
 from datetime import date, timedelta, datetime
 
 DB_PATH = (
@@ -115,12 +116,29 @@ def _extract_lang_code(display_value: str) -> str:
     return display_value.strip()
 
 
-def _prepare_chart_data(rows, start_date, end_date, grouping):
+def _lang_display(lang_code: str) -> str:
+    if not lang_code:
+        return ""
+    name = LANGUAGES.get(lang_code, "")
+    return f"{name} ({lang_code})" if name else lang_code
+
+
+def _contrasting_fg(hex_color: str) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#000000" if (r * 299 + g * 587 + b * 114) / 1000 > 128 else "#ffffff"
+
+
+_ChartData = namedtuple("_ChartData", ["all_acts", "color_map", "p_keys", "p_labels", "by_act_period"])
+
+
+def _prepare_chart_data(rows, start_date, end_date, grouping, user_colors=None):
     """Shared computation for Stats and Cumulative charts. Returns None when rows is empty."""
     if not rows:
         return None
+    _uc       = user_colors or {}
     all_acts  = sorted(set(act for _, act, _ in rows))
-    color_map = {act: _CHART_COLORS[i % len(_CHART_COLORS)] for i, act in enumerate(all_acts)}
+    color_map = {act: (_uc.get(act) or _CHART_COLORS[i % len(_CHART_COLORS)]) for i, act in enumerate(all_acts)}
     data_dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
     eff_start  = start_date or min(data_dates)
     eff_end    = end_date   or max(data_dates)
@@ -130,7 +148,46 @@ def _prepare_chart_data(rows, start_date, end_date, grouping):
     by_act_period = defaultdict(lambda: defaultdict(float))
     for d_str, act, dur in rows:
         by_act_period[act][_period_key(d_str, grouping)] += dur / 60
-    return all_acts, color_map, p_keys, p_labels, by_act_period
+    return _ChartData(all_acts, color_map, p_keys, p_labels, by_act_period)
+
+
+def _validate_session_fields(lang_display, activity_type, dur_raw, date_str, db, parent=None):
+    """Returns (lang_code, duration) on success, None after showing an error dialog."""
+    if lang_display and lang_display not in db.pref_languages():
+        messagebox.showerror("Validation Error",
+            "Language must be selected from the dropdown list or left empty.", parent=parent)
+        return None
+    if not activity_type:
+        messagebox.showerror("Validation Error", "Activity Type is required.", parent=parent)
+        return None
+    try:
+        duration = int(float(str(dur_raw)))
+        if duration < 1:
+            raise ValueError
+    except (ValueError, tk.TclError):
+        messagebox.showerror("Validation Error", "Duration must be a positive integer.", parent=parent)
+        return None
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        messagebox.showerror("Validation Error", "Date must be in YYYY-MM-DD format.", parent=parent)
+        return None
+    return _extract_lang_code(lang_display) if lang_display else None, duration
+
+
+def _build_mpl_frame(parent, canvas_row: int, **adjust_kw):
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    fig = Figure(figsize=(8, 4), dpi=96)
+    fig.subplots_adjust(**adjust_kw)
+    canvas = FigureCanvasTkAgg(fig, master=parent)
+    canvas.get_tk_widget().grid(row=canvas_row, column=0, sticky=tk.NSEW)
+    toolbar_frame = ttk.Frame(parent)
+    toolbar_frame.grid(row=canvas_row + 1, column=0, sticky=tk.EW)
+    NavigationToolbar2Tk(canvas, toolbar_frame)
+    return fig, canvas
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +234,10 @@ class Database:
                 specific_activity TEXT,
                 duration_minutes  INTEGER NOT NULL,
                 notes             TEXT
+            );
+            CREATE TABLE IF NOT EXISTS pref_activity_colors (
+                activity_type TEXT PRIMARY KEY,
+                color         TEXT NOT NULL
             );
         """)
         self.conn.commit()
@@ -335,6 +396,19 @@ class Database:
         self.conn.execute("DELETE FROM templates WHERE id=?", (template_id,))
         self.conn.commit()
 
+    def get_activity_colors(self) -> dict:
+        return {r[0]: r[1] for r in self.conn.execute(
+            "SELECT activity_type, color FROM pref_activity_colors"
+        )}
+
+    def save_activity_colors(self, colors: dict):
+        self.conn.execute("DELETE FROM pref_activity_colors")
+        self.conn.executemany(
+            "INSERT INTO pref_activity_colors (activity_type, color) VALUES (?, ?)",
+            colors.items(),
+        )
+        self.conn.commit()
+
     # ---------- preference saves ----------
 
     def save_lang_prefs(self, selected_codes: set):
@@ -474,6 +548,7 @@ class DatePickerPopup(tk.Toplevel):
     def __init__(self, anchor_widget, var: tk.StringVar):
         root = anchor_widget.winfo_toplevel()
         super().__init__(root)
+        self.withdraw()
         self.var   = var
         self._app_root = root
         self.overrideredirect(True)
@@ -494,6 +569,7 @@ class DatePickerPopup(tk.Toplevel):
         x = anchor_widget.winfo_rootx()
         y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 2
         self.geometry(f"+{x}+{y}")
+        self.deiconify()
 
         self.focus_set()
         self.bind("<Escape>", lambda e: self.destroy())
@@ -538,33 +614,34 @@ class DatePickerPopup(tk.Toplevel):
         self.lbl_year = ttk.Label(year_nav, anchor=tk.CENTER)
         self.lbl_year.pack(side=tk.LEFT, expand=True)
 
-        dow = ttk.Frame(outer, padding=(6, 0))
-        dow.pack(fill=tk.X)
-        for i, d in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
-            ttk.Label(dow, text=d, width=3, anchor=tk.CENTER).grid(row=0, column=i, padx=1)
-
         self.day_frame = ttk.Frame(outer, padding=(6, 2, 6, 4))
         self.day_frame.pack()
+        for i, d in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
+            ttk.Label(self.day_frame, text=d, width=3, anchor=tk.CENTER).grid(row=0, column=i, padx=1)
+        self._day_btns = [
+            [ttk.Button(self.day_frame, text="", width=3) for _ in range(7)]
+            for _ in range(6)
+        ]
+        for r, row in enumerate(self._day_btns):
+            for c, btn in enumerate(row):
+                btn.grid(row=r + 1, column=c, padx=1, pady=1)
 
         # Today button
         ttk.Button(outer, text="Today", command=self._select_today).pack(pady=(0, 6))
 
     def _draw_days(self):
-        import calendar as _cal
-        for w in self.day_frame.winfo_children():
-            w.destroy()
-        self.lbl_month.config(text=_cal.month_name[self.month])
+        self.lbl_month.config(text=calendar.month_name[self.month])
         self.lbl_year.config(text=str(self.year))
-        for r, week in enumerate(_cal.monthcalendar(self.year, self.month)):
+        weeks = calendar.monthcalendar(self.year, self.month)
+        for r in range(6):
+            week = weeks[r] if r < len(weeks) else [0] * 7
             for c, day in enumerate(week):
+                btn = self._day_btns[r][c]
                 if day == 0:
-                    ttk.Label(self.day_frame, text="", width=3).grid(row=r, column=c)
+                    btn.config(text="", state="disabled")
                 else:
-                    btn = ttk.Button(
-                        self.day_frame, text=str(day), width=3,
-                        command=lambda d=date(self.year, self.month, day): self._select(d),
-                    )
-                    btn.grid(row=r, column=c, padx=1, pady=1)
+                    btn.config(text=str(day), state="normal",
+                               command=lambda d=date(self.year, self.month, day): self._select(d))
 
     def _select(self, d: date):
         self.var.set(d.isoformat())
@@ -729,33 +806,17 @@ class LogTab(ttk.Frame):
 
     def save_session(self):
         lang_display  = self.var_language.get().strip()
-        if lang_display and lang_display not in self.db.pref_languages():
-            messagebox.showerror("Validation Error",
-                "Language must be selected from the dropdown list or left empty.")
-            return
-        language      = _extract_lang_code(lang_display) if lang_display else None
         activity_type = self.var_activity_type.get().strip()
         specific      = self.var_specific.get().strip() or None
         notes         = self.txt_notes.get("1.0", tk.END).strip() or None
+        date_str      = self.var_date.get().strip()
 
-        try:
-            duration = int(self.var_duration.get())
-            if duration < 1:
-                raise ValueError
-        except (ValueError, tk.TclError):
-            messagebox.showerror("Validation Error", "Duration must be a positive integer.")
+        result = _validate_session_fields(
+            lang_display, activity_type, self.var_duration.get(), date_str, self.db
+        )
+        if result is None:
             return
-
-        date_str = self.var_date.get().strip()
-        try:
-            datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            messagebox.showerror("Validation Error", "Date must be in YYYY-MM-DD format.")
-            return
-
-        if not activity_type:
-            messagebox.showerror("Validation Error", "Activity Type is required.")
-            return
+        language, duration = result
 
         self.db.insert_session(language, activity_type, specific, duration, date_str, notes)
         self.var_activity_type.set("")
@@ -796,11 +857,7 @@ class LogTab(ttk.Frame):
         if not row:
             return
         lang, act, spec, dur, notes = row
-        if lang:
-            lang_name = LANGUAGES.get(lang, "")
-            self.var_language.set(f"{lang_name} ({lang})" if lang_name else lang)
-        else:
-            self.var_language.set("")
+        self.var_language.set(_lang_display(lang))
         self.var_activity_type.set(act)
         self._on_activity_type_change()
         self.var_specific.set(spec or "")
@@ -835,6 +892,111 @@ class LogTab(ttk.Frame):
                 row=0, column=1
             )
         self._bind_tmpl_scroll(self.tmpl_inner)
+
+
+# ---------------------------------------------------------------------------
+# Timer Tab
+# ---------------------------------------------------------------------------
+
+class TimerTab(ttk.Frame):
+    def __init__(self, parent, log_tab: "LogTab"):
+        super().__init__(parent)
+        self._log_tab    = log_tab
+        self._running    = False
+        self._elapsed    = 0        # accumulated seconds before current run
+        self._tick_start = 0.0      # monotonic time when last started/resumed
+        self._after_id   = None
+        self._build()
+
+    def _build(self):
+        outer = ttk.Frame(self, padding=40)
+        outer.pack(expand=True)
+
+        self.lbl_time = tk.Label(outer, text="00:00", font=("", 64, "bold"))
+        self.lbl_time.pack(pady=(0, 8))
+
+        self.lbl_status = ttk.Label(outer, text="Ready", foreground="gray")
+        self.lbl_status.pack(pady=(0, 24))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack()
+
+        self.btn_startstop = ttk.Button(btn_row, text="Start", width=10,
+                                        command=self._toggle)
+        self.btn_startstop.pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(btn_row, text="Cancel", width=10,
+                   command=self._cancel).pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(btn_row, text="Finish", width=10,
+                   command=self._finish).pack(side=tk.LEFT, padx=6)
+
+    def _total_seconds(self) -> int:
+        if self._running:
+            return self._elapsed + int(time.monotonic() - self._tick_start)
+        return self._elapsed
+
+    def _fmt(self, seconds: int) -> str:
+        h, rem = divmod(seconds, 3600)
+        m, s   = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _tick(self):
+        self.lbl_time.config(text=self._fmt(self._total_seconds()))
+        if self._running:
+            self._after_id = self.after(1000, self._tick)
+
+    def _toggle(self):
+        if self._running:
+            self._elapsed += int(time.monotonic() - self._tick_start)
+            self._running  = False
+            if self._after_id:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+            self.btn_startstop.config(text="Resume")
+            self.lbl_status.config(text="Paused")
+        else:
+            self._tick_start = time.monotonic()
+            self._running    = True
+            self.btn_startstop.config(text="Pause")
+            self.lbl_status.config(text="Running…")
+            self._tick()
+
+    def _cancel(self):
+        if self._running:
+            if self._after_id:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+            self._running = False
+        self._elapsed = 0
+        self.lbl_time.config(text="00:00")
+        self.btn_startstop.config(text="Start")
+        self.lbl_status.config(text="Ready")
+
+    def _finish(self):
+        if self._running:
+            self._elapsed += int(time.monotonic() - self._tick_start)
+            self._running  = False
+            if self._after_id:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+
+        total = self._elapsed
+        if total < 30:
+            messagebox.showwarning("Timer", "Less than 30 seconds elapsed — nothing saved.")
+            return
+
+        minutes = max(1, round(total / 60))
+        self._log_tab.var_duration.set(minutes)
+
+        nb = self.master
+        if isinstance(nb, ttk.Notebook):
+            nb.select(self._log_tab)
+
+        self._cancel()
+        messagebox.showinfo("Timer", f"Duration set to {minutes} minute{'s' if minutes != 1 else ''} in Log Session.")
 
 
 # ---------------------------------------------------------------------------
@@ -925,9 +1087,7 @@ class HistoryTab(ttk.Frame):
 
     def refresh(self):
         lang_codes = self.db.distinct_languages()
-        lang_opts  = ["All"] + [
-            (f"{LANGUAGES[c]} ({c})" if c in LANGUAGES else c) for c in lang_codes
-        ]
+        lang_opts  = ["All"] + [_lang_display(c) for c in lang_codes]
         self.cb_lang["values"] = lang_opts
         self.cb_act["values"]  = ["All"] + self.db.distinct_activities()
 
@@ -942,7 +1102,7 @@ class HistoryTab(ttk.Frame):
             end=self.var_to.get().strip() or None,
         )
         for db_id, date_val, lang, act, spec, dur, notes in rows:
-            lang_disp = (f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang) if lang else ""
+            lang_disp = _lang_display(lang)
             iid = self.tree.insert(
                 "", tk.END,
                 values=(date_val, lang_disp, act, spec or "", dur, notes or ""),
@@ -1003,7 +1163,7 @@ class HistoryTab(ttk.Frame):
             writer.writerow(["Date", "Language", "Activity Type", "Specific Activity",
                              "Duration (min)", "Notes"])
             for db_id, date_val, lang, act, spec, dur, notes in rows:
-                lang_disp = (f"{LANGUAGES[lang]} ({lang})" if lang in LANGUAGES else lang) if lang else ""
+                lang_disp = _lang_display(lang)
                 writer.writerow([date_val, lang_disp, act, spec or "", dur, notes or ""])
         messagebox.showinfo("Export complete", f"Exported {len(rows)} session(s) to:\n{path}")
 
@@ -1021,10 +1181,7 @@ class HistoryTab(ttk.Frame):
             return
         lang_code, act_type, spec_act, duration, date_str, notes = row
 
-        lang_display = ""
-        if lang_code:
-            name = LANGUAGES.get(lang_code, "")
-            lang_display = f"{name} ({lang_code})" if name else lang_code
+        lang_display = _lang_display(lang_code)
 
         dlg = tk.Toplevel(self)
         dlg.title("Edit Session")
@@ -1092,34 +1249,19 @@ class HistoryTab(ttk.Frame):
 
     def _update_session(self, db_id, dlg, var_lang, var_act, var_spec, var_dur, var_date, txt_notes):
         lang_display  = var_lang.get().strip()
-        if lang_display and lang_display not in self.db.pref_languages():
-            messagebox.showerror("Validation Error",
-                "Language must be selected from the dropdown list or left empty.", parent=dlg)
-            return
-        language      = _extract_lang_code(lang_display) if lang_display else None
         activity_type = var_act.get().strip()
         specific      = var_spec.get().strip() or None
         notes         = txt_notes.get("1.0", tk.END).strip() or None
+        date_str      = var_date.get().strip()
 
-        if not activity_type:
-            messagebox.showerror("Validation Error", "Activity Type is required.", parent=dlg)
-            return
-        try:
-            duration = int(float(var_dur.get()))
-            if duration < 1:
-                raise ValueError
-        except (ValueError, tk.TclError):
-            messagebox.showerror("Validation Error", "Duration must be a positive integer.", parent=dlg)
-            return
-        try:
-            datetime.strptime(var_date.get().strip(), "%Y-%m-%d")
-        except ValueError:
-            messagebox.showerror("Validation Error", "Date must be in YYYY-MM-DD format.", parent=dlg)
-            return
-
-        self.db.update_session(
-            db_id, language, activity_type, specific, duration, var_date.get().strip(), notes
+        result = _validate_session_fields(
+            lang_display, activity_type, var_dur.get(), date_str, self.db, parent=dlg
         )
+        if result is None:
+            return
+        language, duration = result
+
+        self.db.update_session(db_id, language, activity_type, specific, duration, date_str, notes)
         dlg.destroy()
         self.refresh()
 
@@ -1146,18 +1288,10 @@ class StatsTab(ttk.Frame):
         self.filter_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
 
     def _init_chart(self):
-        import matplotlib
-        matplotlib.use("TkAgg")
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-        frame = self._chart_parent
-        self.fig = Figure(figsize=(8, 4), dpi=96)
-        self.fig.subplots_adjust(left=0.08, right=0.95, bottom=0.15, top=0.88, wspace=0.4)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
-        self.canvas.get_tk_widget().grid(row=1, column=0, sticky=tk.NSEW)
-        toolbar_frame = ttk.Frame(frame)
-        toolbar_frame.grid(row=2, column=0, sticky=tk.EW)
-        NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.fig, self.canvas = _build_mpl_frame(
+            self._chart_parent, canvas_row=1,
+            left=0.08, right=0.95, bottom=0.15, top=0.88, wspace=0.4,
+        )
 
     def refresh_prefs(self):
         self.filter_bar.refresh_lang_options()
@@ -1186,7 +1320,8 @@ class StatsTab(ttk.Frame):
         )
         ax_bar   = self.fig.add_subplot(1, 2, 1)
         ax_pie   = self.fig.add_subplot(1, 2, 2)
-        prepared = _prepare_chart_data(rows, start_date, end_date, grouping)
+        prepared = _prepare_chart_data(rows, start_date, end_date, grouping,
+                                       user_colors=self.db.get_activity_colors())
 
         if prepared is None:
             for ax in (ax_bar, ax_pie):
@@ -1263,18 +1398,10 @@ class CumulativeTab(ttk.Frame):
         )
 
     def _init_chart(self):
-        import matplotlib
-        matplotlib.use("TkAgg")
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-        frame = self._chart_parent
-        self.fig = Figure(figsize=(8, 4), dpi=96)
-        self.fig.subplots_adjust(left=0.1, right=0.97, bottom=0.15, top=0.88)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
-        self.canvas.get_tk_widget().grid(row=2, column=0, sticky=tk.NSEW)
-        toolbar_frame = ttk.Frame(frame)
-        toolbar_frame.grid(row=3, column=0, sticky=tk.EW)
-        NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.fig, self.canvas = _build_mpl_frame(
+            self._chart_parent, canvas_row=2,
+            left=0.1, right=0.97, bottom=0.15, top=0.88,
+        )
 
     def refresh_prefs(self):
         self.filter_bar.refresh_lang_options()
@@ -1302,7 +1429,8 @@ class CumulativeTab(ttk.Frame):
             end=end_str or None,
         )
         ax       = self.fig.add_subplot(1, 1, 1)
-        prepared = _prepare_chart_data(rows, start_date, end_date, grouping)
+        prepared = _prepare_chart_data(rows, start_date, end_date, grouping,
+                                       user_colors=self.db.get_activity_colors())
 
         if prepared is None:
             self.var_summary.set("No data in the selected range.")
@@ -1398,6 +1526,39 @@ class SettingsTab(ttk.Frame):
         cb.grid(row=1, column=0, padx=12, sticky=tk.W)
         cb.bind("<<ComboboxSelected>>", self._apply_theme)
 
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
+            row=2, column=0, columnspan=2, sticky=tk.EW, padx=12, pady=(16, 8)
+        )
+        ttk.Label(parent, text="Activity type colors:").grid(
+            row=3, column=0, padx=12, pady=(0, 4), sticky=tk.W
+        )
+
+        saved = self.db.get_activity_colors()
+        self._activity_colors = {}
+        self._color_buttons   = {}
+        for i, act in enumerate(sorted(ACTIVITIES)):
+            color = saved.get(act, _CHART_COLORS[i % len(_CHART_COLORS)])
+            self._activity_colors[act] = color
+            row = 4 + i
+            ttk.Label(parent, text=act).grid(row=row, column=0, padx=(24, 8), pady=2, sticky=tk.W)
+            btn = tk.Button(
+                parent, bg=color, fg=_contrasting_fg(color), text=color,
+                width=9, relief="flat", command=lambda a=act: self._pick_color(a),
+            )
+            btn.grid(row=row, column=1, padx=(0, 12), pady=2, sticky=tk.W)
+            self._color_buttons[act] = btn
+
+    def _pick_color(self, act: str):
+        current = self._activity_colors.get(act, "#ffffff")
+        result  = colorchooser.askcolor(color=current, title=f"Color for {act}", parent=self)
+        if result and result[1]:
+            color = result[1]
+            self._activity_colors[act] = color
+            self._color_buttons[act].config(bg=color, fg=_contrasting_fg(color), text=color)
+
+    def _save_activity_colors(self):
+        self.db.save_activity_colors(self._activity_colors)
+
     def _apply_theme(self, event=None):
         ttk.Style().theme_use(self.var_theme.get())
 
@@ -1405,6 +1566,7 @@ class SettingsTab(ttk.Frame):
         self._save_lang()
         self._save_activity()
         self._save_specific()
+        self._save_activity_colors()
         self._on_prefs_changed()
         messagebox.showinfo("Saved", "Settings saved.")
 
@@ -1597,114 +1759,11 @@ def _preload_matplotlib():
     from matplotlib.ticker import FuncFormatter  # noqa: F401
 
 
-class TimerTab(ttk.Frame):
-    def __init__(self, parent, log_tab: "LogTab"):
-        super().__init__(parent)
-        self._log_tab    = log_tab
-        self._running    = False
-        self._elapsed    = 0        # accumulated seconds before current run
-        self._tick_start = 0.0      # monotonic time when last started/resumed
-        self._after_id   = None
-        self._build()
-
-    def _build(self):
-        outer = ttk.Frame(self, padding=40)
-        outer.pack(expand=True)
-
-        self.lbl_time = tk.Label(outer, text="00:00", font=("", 64, "bold"))
-        self.lbl_time.pack(pady=(0, 8))
-
-        self.lbl_status = ttk.Label(outer, text="Ready", foreground="gray")
-        self.lbl_status.pack(pady=(0, 24))
-
-        btn_row = ttk.Frame(outer)
-        btn_row.pack()
-
-        self.btn_startstop = ttk.Button(btn_row, text="Start", width=10,
-                                        command=self._toggle)
-        self.btn_startstop.pack(side=tk.LEFT, padx=6)
-
-        ttk.Button(btn_row, text="Cancel", width=10,
-                   command=self._cancel).pack(side=tk.LEFT, padx=6)
-
-        ttk.Button(btn_row, text="Finish", width=10,
-                   command=self._finish).pack(side=tk.LEFT, padx=6)
-
-    # ------------------------------------------------------------------
-    def _total_seconds(self) -> int:
-        if self._running:
-            return self._elapsed + int(time.monotonic() - self._tick_start)
-        return self._elapsed
-
-    def _fmt(self, seconds: int) -> str:
-        h, rem = divmod(seconds, 3600)
-        m, s   = divmod(rem, 60)
-        if h:
-            return f"{h}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
-
-    def _tick(self):
-        self.lbl_time.config(text=self._fmt(self._total_seconds()))
-        if self._running:
-            self._after_id = self.after(1000, self._tick)
-
-    def _toggle(self):
-        if self._running:
-            # pause
-            self._elapsed += int(time.monotonic() - self._tick_start)
-            self._running  = False
-            if self._after_id:
-                self.after_cancel(self._after_id)
-                self._after_id = None
-            self.btn_startstop.config(text="Resume")
-            self.lbl_status.config(text="Paused")
-        else:
-            # start / resume
-            self._tick_start = time.monotonic()
-            self._running    = True
-            self.btn_startstop.config(text="Pause")
-            self.lbl_status.config(text="Running…")
-            self._tick()
-
-    def _cancel(self):
-        if self._running:
-            if self._after_id:
-                self.after_cancel(self._after_id)
-                self._after_id = None
-            self._running = False
-        self._elapsed = 0
-        self.lbl_time.config(text="00:00")
-        self.btn_startstop.config(text="Start")
-        self.lbl_status.config(text="Ready")
-
-    def _finish(self):
-        if self._running:
-            self._elapsed += int(time.monotonic() - self._tick_start)
-            self._running  = False
-            if self._after_id:
-                self.after_cancel(self._after_id)
-                self._after_id = None
-
-        total = self._elapsed
-        if total < 30:
-            messagebox.showwarning("Timer", "Less than 30 seconds elapsed — nothing saved.")
-            return
-
-        minutes = max(1, round(total / 60))
-        self._log_tab.var_duration.set(minutes)
-
-        # switch to Log Session tab
-        nb = self.master
-        if isinstance(nb, ttk.Notebook):
-            nb.select(self._log_tab)
-
-        self._cancel()
-        messagebox.showinfo("Timer", f"Duration set to {minutes} minute{'s' if minutes != 1 else ''} in Log Session.")
-
-
 class LanguageLoggerApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        threading.Thread(target=_preload_matplotlib, daemon=True).start()
+
         self.title("Language Learning Logger")
         self.geometry("920x620")
         self.minsize(740, 520)
@@ -1730,8 +1789,6 @@ class LanguageLoggerApp(tk.Tk):
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
         self.bind("<Control-s>", self._on_ctrl_s)
-
-        threading.Thread(target=_preload_matplotlib, daemon=True).start()
 
     def _on_ctrl_s(self, event=None):
         selected = self.notebook.select()
