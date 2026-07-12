@@ -72,6 +72,40 @@ _CHART_COLORS = [
     "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
 ]
 
+# FSI (U.S. Foreign Service Institute) difficulty categories for native English
+# speakers, and roughly how long each takes to reach professional working
+# proficiency in a classroom setting.
+FSI_CATEGORIES = {
+    "I":   {"hours": "600-750",  "weeks": "24-30", "desc": "Languages closely related to English"},
+    "II":  {"hours": "900",      "weeks": "36",    "desc": "Similar languages"},
+    "III": {"hours": "1100",     "weeks": "44",    "desc": "Languages with significant linguistic/cultural differences"},
+    "IV":  {"hours": "2200",     "weeks": "88",    "desc": "Exceptionally difficult for English speakers"},
+}
+
+# code -> (FSI category, is_estimated). is_estimated=True means the language is
+# not on FSI's official list and the category is extrapolated from its closest
+# relatives / typological profile.
+LANGUAGE_DIFFICULTY = {
+    "af": ("I", False),   "sq": ("III", False), "ar": ("IV", False),  "hy": ("III", False),
+    "az": ("III", False), "eu": ("IV", True),   "be": ("III", True),  "bn": ("III", False),
+    "bs": ("III", False), "bg": ("III", False), "ca": ("I", True),    "zh": ("IV", False),
+    "hr": ("III", False), "cs": ("III", False), "da": ("I", False),   "nl": ("I", False),
+    "et": ("III", False), "fi": ("III", False), "fr": ("I", False),   "gl": ("I", True),
+    "ka": ("III", False), "de": ("II", False),  "el": ("III", False), "gu": ("III", True),
+    "ht": ("II", False),  "he": ("III", False), "hi": ("III", False), "hu": ("III", False),
+    "is": ("III", False), "id": ("II", False),  "ga": ("IV", True),   "it": ("I", False),
+    "ja": ("IV", False),  "kn": ("III", True),  "kk": ("III", False), "ko": ("IV", False),
+    "ku": ("III", True),  "lv": ("III", False), "lt": ("III", False), "mk": ("III", True),
+    "ms": ("II", False),  "ml": ("III", True),  "mt": ("III", True),  "mr": ("III", True),
+    "mn": ("III", False), "ne": ("III", False), "no": ("I", False),   "fa": ("III", False),
+    "pl": ("III", False), "pt": ("I", False),   "pa": ("III", False), "ro": ("I", False),
+    "ru": ("III", False), "sr": ("III", False), "sk": ("III", False), "sl": ("III", False),
+    "es": ("I", False),   "sw": ("II", False),  "sv": ("I", False),   "tl": ("III", False),
+    "ta": ("III", False), "te": ("III", False), "th": ("III", False), "tr": ("III", False),
+    "uk": ("III", False), "ur": ("III", False), "uz": ("III", False), "vi": ("III", False),
+    "cy": ("IV", True),   "yi": ("II", True),
+}
+
 
 def _fmt_time(total_minutes: float) -> str:
     m = int(round(total_minutes))
@@ -1503,7 +1537,98 @@ class CumulativeTab(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
-# Tab 5 — Settings
+# Tab 5 — Learning Time
+# ---------------------------------------------------------------------------
+
+class LearningTimeTab(ttk.Frame):
+    """Static reference table: how long it typically takes to learn a language,
+    based on FSI difficulty categories. Highlights languages the user has
+    actually logged sessions for."""
+
+    def __init__(self, parent, db: Database):
+        super().__init__(parent)
+        self.db            = db
+        self._sort_column  = "category"
+        self._sort_reverse = False
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            frame,
+            text=("Estimated study time to reach professional working proficiency, based on the "
+                  "U.S. Foreign Service Institute's language difficulty categories (assumes roughly "
+                  "25 classroom hours/week; self-study usually takes longer). Rows highlighted in "
+                  "green are languages you've already logged sessions for."),
+            foreground="gray", wraplength=860, justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
+
+        columns = ("language", "category", "hours", "weeks", "note")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        col_cfg = [
+            ("language", "Language",         160),
+            ("category", "FSI Category",     100),
+            ("hours",    "Est. Class Hours", 120),
+            ("weeks",    "Est. Weeks",       90),
+            ("note",     "Notes",            320),
+        ]
+        for col_id, heading, width in col_cfg:
+            self.tree.heading(col_id, text=heading, command=lambda c=col_id: self._sort(c))
+            self.tree.column(col_id, width=width, anchor=tk.W)
+
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=1, column=0, sticky=tk.NSEW)
+        vsb.grid(row=1, column=1, sticky=tk.NS)
+
+        self.tree.tag_configure("studied", background="#dcf0dc")
+
+        self.refresh()
+
+    def refresh(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        studied = set(self.db.distinct_languages())
+        rows = sorted(
+            ((code, name) for code, name in LANGUAGES.items() if code in LANGUAGE_DIFFICULTY),
+            key=lambda cn: (LANGUAGE_DIFFICULTY[cn[0]][0], cn[1]),
+        )
+        for code, name in rows:
+            category, estimated = LANGUAGE_DIFFICULTY[code]
+            info = FSI_CATEGORIES[category]
+            note = info["desc"] + (" (estimated — not an official FSI rating)" if estimated else "")
+            tags = ("studied",) if code in studied else ()
+            self.tree.insert(
+                "", tk.END,
+                values=(f"{name} ({code})", category, info["hours"], info["weeks"], note),
+                tags=tags,
+            )
+        self._sort(self._sort_column, force_reverse=self._sort_reverse)
+
+    def _sort(self, column, force_reverse=None):
+        reverse = force_reverse if force_reverse is not None else (
+            (column == self._sort_column) and not self._sort_reverse
+        )
+        self._sort_column, self._sort_reverse = column, reverse
+        items = [(self.tree.set(iid, column), iid) for iid in self.tree.get_children()]
+        if column in ("hours", "weeks"):
+            def num_key(pair):
+                digits = "".join(ch if ch.isdigit() else " " for ch in pair[0]).split()
+                return int(digits[0]) if digits else 0
+            items.sort(key=num_key, reverse=reverse)
+        else:
+            items.sort(reverse=reverse)
+        for index, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", index)
+
+
+# ---------------------------------------------------------------------------
+# Tab 6 — Settings
 # ---------------------------------------------------------------------------
 
 class SettingsTab(ttk.Frame):
@@ -1797,16 +1922,18 @@ class LanguageLoggerApp(tk.Tk):
         self.tab_log      = LogTab(self.notebook, db)
         self.tab_timer    = TimerTab(self.notebook, self.tab_log)
         self.tab_history  = HistoryTab(self.notebook, db)
-        self.tab_stats    = StatsTab(self.notebook, db)
-        self.tab_cumul    = CumulativeTab(self.notebook, db)
-        self.tab_settings = SettingsTab(self.notebook, db, on_prefs_changed=self._on_prefs_changed)
+        self.tab_stats     = StatsTab(self.notebook, db)
+        self.tab_cumul     = CumulativeTab(self.notebook, db)
+        self.tab_learntime = LearningTimeTab(self.notebook, db)
+        self.tab_settings  = SettingsTab(self.notebook, db, on_prefs_changed=self._on_prefs_changed)
 
-        self.notebook.add(self.tab_log,      text="  Log Session  ")
-        self.notebook.add(self.tab_history,  text="  History  ")
-        self.notebook.add(self.tab_stats,    text="  Stats  ")
-        self.notebook.add(self.tab_cumul,    text="  Cumulative  ")
-        self.notebook.add(self.tab_settings, text="  Settings  ")
-        self.notebook.add(self.tab_timer,    text="  Timer  ")
+        self.notebook.add(self.tab_log,       text="  Log Session  ")
+        self.notebook.add(self.tab_history,   text="  History  ")
+        self.notebook.add(self.tab_stats,     text="  Stats  ")
+        self.notebook.add(self.tab_cumul,     text="  Cumulative  ")
+        self.notebook.add(self.tab_learntime, text="  Learning Time  ")
+        self.notebook.add(self.tab_settings,  text="  Settings  ")
+        self.notebook.add(self.tab_timer,     text="  Timer  ")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
         self.bind("<Control-s>", self._on_ctrl_s)
@@ -1831,6 +1958,8 @@ class LanguageLoggerApp(tk.Tk):
             self.tab_stats.refresh()
         elif selected == str(self.tab_cumul):
             self.tab_cumul.refresh()
+        elif selected == str(self.tab_learntime):
+            self.tab_learntime.refresh()
 
 
 def _cli_list_templates():
