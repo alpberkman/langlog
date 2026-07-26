@@ -106,6 +106,23 @@ LANGUAGE_DIFFICULTY = {
     "cy": ("IV", True),   "yi": ("II", True),
 }
 
+# Commonly-cited approximate vocabulary size (word families) needed to reach
+# each CEFR level. These figures vary a fair amount by source/language; treat
+# as ballpark estimates, not a precise target.
+CEFR_WORD_COUNTS = [
+    ("A1", 500), ("A2", 1000), ("B1", 2000), ("B2", 4000), ("C1", 8000), ("C2", 16000),
+]
+
+# Languages that have their own widely-used proficiency scale (distinct from
+# CEFR), with approximate cumulative vocabulary size per level.
+NATIVE_LEVEL_SYSTEMS = {
+    "zh": ("HSK",   [("HSK 1", 150), ("HSK 2", 300), ("HSK 3", 600),
+                      ("HSK 4", 1200), ("HSK 5", 2500), ("HSK 6", 5000)]),
+    "ja": ("JLPT",  [("N5", 800), ("N4", 1500), ("N3", 3750), ("N2", 6000), ("N1", 10000)]),
+    "ko": ("TOPIK", [("TOPIK I-1", 1000), ("TOPIK I-2", 2000), ("TOPIK II-3", 4000),
+                      ("TOPIK II-4", 6000), ("TOPIK II-5", 8000), ("TOPIK II-6", 10000)]),
+}
+
 
 def _fmt_time(total_minutes: float) -> str:
     m = int(round(total_minutes))
@@ -1628,7 +1645,91 @@ class LearningTimeTab(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
-# Tab 6 — Settings
+# Tab 6 — Vocabulary
+# ---------------------------------------------------------------------------
+
+class VocabTab(ttk.Frame):
+    """Reference table: approximate vocabulary size needed per proficiency
+    level, for the user's enabled languages. Shows CEFR estimates for every
+    language, plus the language's own scale (HSK/JLPT/TOPIK) where one exists."""
+
+    def __init__(self, parent, db: Database):
+        super().__init__(parent)
+        self.db = db
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            frame,
+            text=("Approximate vocabulary size needed to reach each proficiency level, for your "
+                  "enabled languages (Settings → Languages). CEFR figures are commonly-cited "
+                  "ballpark estimates and vary by source. Where a language has its own official scale "
+                  "(HSK for Chinese, JLPT for Japanese, TOPIK for Korean), that's shown alongside CEFR."),
+            foreground="gray", wraplength=860, justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
+
+        filter_row = ttk.Frame(frame)
+        filter_row.grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
+        ttk.Label(filter_row, text="Language:").pack(side=tk.LEFT)
+        self.var_lang = tk.StringVar(value="All")
+        self.cb_lang = ttk.Combobox(filter_row, textvariable=self.var_lang, state="readonly", width=30)
+        self.cb_lang.pack(side=tk.LEFT, padx=(4, 0))
+        self.cb_lang.bind("<<ComboboxSelected>>", lambda e: self._populate())
+
+        columns = ("language", "system", "level", "words")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        col_cfg = [
+            ("language", "Language",   160),
+            ("system",   "System",    90),
+            ("level",    "Level",     110),
+            ("words",    "Est. Words", 100),
+        ]
+        for col_id, heading, width in col_cfg:
+            self.tree.heading(col_id, text=heading)
+            self.tree.column(col_id, width=width, anchor=tk.W)
+
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=2, column=0, sticky=tk.NSEW)
+        vsb.grid(row=2, column=1, sticky=tk.NS)
+
+        self.refresh()
+
+    def refresh(self):
+        enabled = self.db.pref_languages()
+        self.cb_lang["values"] = ["All"] + enabled
+        if self.var_lang.get() not in self.cb_lang["values"]:
+            self.var_lang.set("All")
+        self._populate()
+
+    def _populate(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        selected = self.var_lang.get()
+        if selected == "All":
+            codes = [_extract_lang_code(o) for o in self.db.pref_languages()]
+        else:
+            codes = [_extract_lang_code(selected)]
+
+        for code in codes:
+            name = _lang_display(code) or code
+            for level, words in CEFR_WORD_COUNTS:
+                self.tree.insert("", tk.END, values=(name, "CEFR", level, f"~{words:,}"))
+            native = NATIVE_LEVEL_SYSTEMS.get(code)
+            if native:
+                system_name, levels = native
+                for level, words in levels:
+                    self.tree.insert("", tk.END, values=(name, system_name, level, f"~{words:,}"))
+
+
+# ---------------------------------------------------------------------------
+# Tab 7 — Settings
 # ---------------------------------------------------------------------------
 
 class SettingsTab(ttk.Frame):
@@ -1925,6 +2026,7 @@ class LanguageLoggerApp(tk.Tk):
         self.tab_stats     = StatsTab(self.notebook, db)
         self.tab_cumul     = CumulativeTab(self.notebook, db)
         self.tab_learntime = LearningTimeTab(self.notebook, db)
+        self.tab_vocab     = VocabTab(self.notebook, db)
         self.tab_settings  = SettingsTab(self.notebook, db, on_prefs_changed=self._on_prefs_changed)
 
         self.notebook.add(self.tab_log,       text="  Log Session  ")
@@ -1932,6 +2034,7 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook.add(self.tab_stats,     text="  Stats  ")
         self.notebook.add(self.tab_cumul,     text="  Cumulative  ")
         self.notebook.add(self.tab_learntime, text="  Learning Time  ")
+        self.notebook.add(self.tab_vocab,     text="  Vocabulary  ")
         self.notebook.add(self.tab_settings,  text="  Settings  ")
         self.notebook.add(self.tab_timer,     text="  Timer  ")
 
@@ -1949,6 +2052,7 @@ class LanguageLoggerApp(tk.Tk):
         self.tab_log.refresh_prefs()
         self.tab_stats.refresh_prefs()
         self.tab_cumul.refresh_prefs()
+        self.tab_vocab.refresh()
 
     def _on_tab_change(self, event):
         selected = self.notebook.select()
