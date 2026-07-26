@@ -216,6 +216,25 @@ def _prepare_chart_data(rows, start_date, end_date, grouping, user_colors=None):
     return _ChartData(all_acts, color_map, p_keys, p_labels, by_act_period)
 
 
+def _load_chart_context(db: "Database", filter_bar: "FilterBar"):
+    """Shared refresh step for Stats and Cumulative: parses the filter bar's date
+    range, fetches matching rows, and runs _prepare_chart_data. Returns
+    (rows, prepared) on success, or None after showing an error dialog if the
+    dates are invalid."""
+    start_str = filter_bar.start_str
+    end_str   = filter_bar.end_str
+    try:
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
+        end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date() if end_str   else None
+    except ValueError:
+        messagebox.showerror("Invalid Date", "Dates must be in YYYY-MM-DD format.")
+        return None
+    rows = db.get_chart_rows(lang_code=filter_bar.lang_code, start=start_str or None, end=end_str or None)
+    prepared = _prepare_chart_data(rows, start_date, end_date, filter_bar.grouping,
+                                    user_colors=db.get_activity_colors())
+    return rows, prepared
+
+
 def _validate_session_fields(lang_display, activity_type, dur_raw, date_str, db, parent=None):
     """Returns (lang_code, duration) on success, None after showing an error dialog."""
     if lang_display and lang_display not in db.pref_languages():
@@ -253,6 +272,28 @@ def _build_mpl_frame(parent, canvas_row: int, **adjust_kw):
     toolbar_frame.grid(row=canvas_row + 1, column=0, sticky=tk.EW)
     NavigationToolbar2Tk(canvas, toolbar_frame)
     return fig, canvas
+
+
+def _sort_treeview(tree: ttk.Treeview, column: str, state: dict, numeric_columns=(), reverse=None):
+    """Sorts a Treeview's rows by `column`, toggling direction on repeat calls.
+    `state` is a {"column": ..., "reverse": ...} dict mutated in place so the
+    chosen order can be reapplied (e.g. after a refresh rebuilds the rows).
+    Columns named in `numeric_columns` sort by their first embedded number
+    (handles plain integers and ranges like "600-750") instead of as text."""
+    if reverse is None:
+        reverse = (column == state["column"]) and not state["reverse"]
+    state["column"], state["reverse"] = column, reverse
+
+    items = [(tree.set(iid, column), iid) for iid in tree.get_children()]
+    if column in numeric_columns:
+        def key(pair):
+            digits = "".join(ch if ch.isdigit() else " " for ch in pair[0]).split()
+            return int(digits[0]) if digits else 0
+        items.sort(key=key, reverse=reverse)
+    else:
+        items.sort(reverse=reverse)
+    for index, (_, iid) in enumerate(items):
+        tree.move(iid, "", index)
 
 
 # ---------------------------------------------------------------------------
@@ -1080,8 +1121,7 @@ class HistoryTab(ttk.Frame):
         super().__init__(parent)
         self.db            = db
         self._tree_id_map  = {}
-        self._sort_column  = "date"
-        self._sort_reverse = True
+        self._sort_state   = {"column": "date", "reverse": True}
         self._build()
 
     def _build(self):
@@ -1197,16 +1237,7 @@ class HistoryTab(ttk.Frame):
         del self._tree_id_map[iid]
 
     def _sort(self, column):
-        reverse = (column == self._sort_column) and not self._sort_reverse
-        self._sort_column  = column
-        self._sort_reverse = reverse
-        items = [(self.tree.set(iid, column), iid) for iid in self.tree.get_children()]
-        if column == "duration":
-            items.sort(key=lambda x: int(x[0]) if x[0].isdigit() else 0, reverse=reverse)
-        else:
-            items.sort(reverse=reverse)
-        for index, (_, iid) in enumerate(items):
-            self.tree.move(iid, "", index)
+        _sort_treeview(self.tree, column, self._sort_state, numeric_columns=("duration",))
 
     def _clear_filter(self):
         self.var_lang.set("All")
@@ -1374,26 +1405,14 @@ class StatsTab(ttk.Frame):
         from matplotlib.ticker import FuncFormatter
         self.fig.clear()
 
-        start_str = self.filter_bar.start_str
-        end_str   = self.filter_bar.end_str
-        grouping  = self.filter_bar.grouping
-
-        try:
-            start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
-            end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date() if end_str   else None
-        except ValueError:
-            messagebox.showerror("Invalid Date", "Dates must be in YYYY-MM-DD format.")
+        context = _load_chart_context(self.db, self.filter_bar)
+        if context is None:
             return
+        rows, prepared = context
+        grouping = self.filter_bar.grouping
 
-        rows     = self.db.get_chart_rows(
-            lang_code=self.filter_bar.lang_code,
-            start=start_str or None,
-            end=end_str or None,
-        )
-        ax_bar   = self.fig.add_subplot(1, 2, 1)
-        ax_pie   = self.fig.add_subplot(1, 2, 2)
-        prepared = _prepare_chart_data(rows, start_date, end_date, grouping,
-                                       user_colors=self.db.get_activity_colors())
+        ax_bar = self.fig.add_subplot(1, 2, 1)
+        ax_pie = self.fig.add_subplot(1, 2, 2)
 
         if prepared is None:
             for ax in (ax_bar, ax_pie):
@@ -1484,25 +1503,13 @@ class CumulativeTab(ttk.Frame):
         from matplotlib.ticker import FuncFormatter
         self.fig.clear()
 
-        start_str = self.filter_bar.start_str
-        end_str   = self.filter_bar.end_str
-        grouping  = self.filter_bar.grouping
-
-        try:
-            start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
-            end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date() if end_str   else None
-        except ValueError:
-            messagebox.showerror("Invalid Date", "Dates must be in YYYY-MM-DD format.")
+        context = _load_chart_context(self.db, self.filter_bar)
+        if context is None:
             return
+        rows, prepared = context
+        grouping = self.filter_bar.grouping
 
-        rows     = self.db.get_chart_rows(
-            lang_code=self.filter_bar.lang_code,
-            start=start_str or None,
-            end=end_str or None,
-        )
-        ax       = self.fig.add_subplot(1, 1, 1)
-        prepared = _prepare_chart_data(rows, start_date, end_date, grouping,
-                                       user_colors=self.db.get_activity_colors())
+        ax = self.fig.add_subplot(1, 1, 1)
 
         if prepared is None:
             self.var_summary.set("No data in the selected range.")
@@ -1564,9 +1571,8 @@ class LearningTimeTab(ttk.Frame):
 
     def __init__(self, parent, db: Database):
         super().__init__(parent)
-        self.db            = db
-        self._sort_column  = "category"
-        self._sort_reverse = False
+        self.db          = db
+        self._sort_state = {"column": "category", "reverse": False}
         self._build()
 
     def _build(self):
@@ -1625,23 +1631,11 @@ class LearningTimeTab(ttk.Frame):
                 values=(f"{name} ({code})", category, info["hours"], info["weeks"], note),
                 tags=tags,
             )
-        self._sort(self._sort_column, force_reverse=self._sort_reverse)
+        _sort_treeview(self.tree, self._sort_state["column"], self._sort_state,
+                       numeric_columns=("hours", "weeks"), reverse=self._sort_state["reverse"])
 
-    def _sort(self, column, force_reverse=None):
-        reverse = force_reverse if force_reverse is not None else (
-            (column == self._sort_column) and not self._sort_reverse
-        )
-        self._sort_column, self._sort_reverse = column, reverse
-        items = [(self.tree.set(iid, column), iid) for iid in self.tree.get_children()]
-        if column in ("hours", "weeks"):
-            def num_key(pair):
-                digits = "".join(ch if ch.isdigit() else " " for ch in pair[0]).split()
-                return int(digits[0]) if digits else 0
-            items.sort(key=num_key, reverse=reverse)
-        else:
-            items.sort(reverse=reverse)
-        for index, (_, iid) in enumerate(items):
-            self.tree.move(iid, "", index)
+    def _sort(self, column):
+        _sort_treeview(self.tree, column, self._sort_state, numeric_columns=("hours", "weeks"))
 
 
 # ---------------------------------------------------------------------------
@@ -2020,9 +2014,9 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.tab_log      = LogTab(self.notebook, db)
-        self.tab_timer    = TimerTab(self.notebook, self.tab_log)
-        self.tab_history  = HistoryTab(self.notebook, db)
+        self.tab_log       = LogTab(self.notebook, db)
+        self.tab_timer     = TimerTab(self.notebook, self.tab_log)
+        self.tab_history   = HistoryTab(self.notebook, db)
         self.tab_stats     = StatsTab(self.notebook, db)
         self.tab_cumul     = CumulativeTab(self.notebook, db)
         self.tab_learntime = LearningTimeTab(self.notebook, db)
