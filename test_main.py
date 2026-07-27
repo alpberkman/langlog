@@ -146,6 +146,106 @@ class TestPrepareChartData(unittest.TestCase):
         self.assertEqual(data.color_map["Reading"], "#123456")
 
 
+class TestSummaryLine(unittest.TestCase):
+    def test_computes_sessions_total_avg_and_top_activity(self):
+        rows = [
+            ("2026-07-01", "Reading", 30),
+            ("2026-07-02", "Reading", 30),
+            ("2026-07-03", "Listening", 15),
+        ]
+        line = main._summary_line(rows, ["2026-07-01", "2026-07-02", "2026-07-03"], "Day")
+        self.assertIn("Sessions: 3", line)
+        self.assertIn("Total: 01:15", line)
+        self.assertIn("Avg session: 00:25", line)
+        self.assertIn("Avg per Day: 00:25", line)
+        self.assertIn("Top activity: Reading", line)
+
+
+class TestProjectLevels(unittest.TestCase):
+    def test_hours_needed_scales_with_word_count_ratio(self):
+        # C1 is the anchor level: hours_needed == the category's FSI hour estimate exactly.
+        results = main._project_levels(
+            total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01",
+            fsi_category="III", today=date(2026, 1, 1),
+        )
+        levels = {r.level: r for r in results}
+        self.assertAlmostEqual(levels["C1"].hours_needed, 1100)
+        self.assertAlmostEqual(levels["A1"].hours_needed, 1100 * 500 / 8000)
+        self.assertAlmostEqual(levels["C2"].hours_needed, 1100 * 16000 / 8000)
+
+    def test_days_remaining_and_target_date_match_historical_pace(self):
+        # One 60-minute session logged on a single day -> pace of 1 hour/day.
+        results = main._project_levels(
+            total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01",
+            fsi_category="II", today=date(2026, 1, 1),
+        )
+        c1 = next(r for r in results if r.level == "C1")
+        self.assertAlmostEqual(c1.hours_needed, 900)  # category II's hours_est
+        self.assertEqual(c1.days_remaining, 899)       # 899 hours left at 1 hour/day
+        self.assertEqual(c1.target_date, date(2026, 1, 1) + timedelta(days=899))
+
+    def test_already_reached_levels_have_no_days_remaining(self):
+        results = main._project_levels(
+            total_minutes=100 * 60, first_date_str="2026-01-01", last_date_str="2026-01-11",
+            fsi_category="I", today=date(2026, 1, 11),
+        )
+        levels = {r.level: r for r in results}
+        self.assertIsNone(levels["A1"].days_remaining)
+        self.assertIsNone(levels["A1"].target_date)
+        self.assertIsNotNone(levels["C2"].days_remaining)
+        self.assertIsNotNone(levels["C2"].target_date)
+
+
+class TestIncrementalLevels(unittest.TestCase):
+    def test_first_level_added_equals_its_own_total(self):
+        # A1's "previous level" is zero, so words/hours added == the level's own totals.
+        results = main._incremental_levels("III")
+        a1 = next(r for r in results if r.level == "A1")
+        self.assertEqual(a1.words_added, 500)
+        self.assertAlmostEqual(a1.hours_added, 1100 * 500 / 8000)
+
+    def test_deltas_sum_back_to_cumulative_totals(self):
+        category = "II"
+        incremental = main._incremental_levels(category)
+        cumulative = main._project_levels(
+            total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01", fsi_category=category
+        )
+        running_words, running_hours = 0, 0.0
+        for inc, cum in zip(incremental, cumulative):
+            running_words += inc.words_added
+            running_hours += inc.hours_added
+            self.assertEqual(running_words, cum.words)
+            self.assertAlmostEqual(running_hours, cum.hours_needed)
+
+    def test_higher_category_needs_more_incremental_hours(self):
+        easy = {r.level: r for r in main._incremental_levels("I")}
+        hard = {r.level: r for r in main._incremental_levels("IV")}
+        for level in ("A1", "B1", "C1"):
+            self.assertGreater(hard[level].hours_added, easy[level].hours_added)
+
+    def test_custom_word_counts_table_uses_cefr_c1_anchor(self):
+        # JLPT's N1 (10,000 words) should scale off the *same* CEFR-C1 (8,000
+        # words) anchor as CEFR itself, not off JLPT's own top level.
+        jlpt_name, jlpt_levels = main.NATIVE_LEVEL_SYSTEMS["ja"]
+        results = main._incremental_levels("IV", word_counts=jlpt_levels)
+        n1 = next(r for r in results if r.level == "N1")
+        cumulative_hours = sum(r.hours_added for r in results)
+        self.assertAlmostEqual(cumulative_hours, 2200 * 10000 / 8000)
+        self.assertEqual(n1.words_added, 10000 - 6000)  # N1 - N2
+
+
+class TestFormatDaysInUnit(unittest.TestCase):
+    def test_day_unit_returns_plain_integer_string(self):
+        self.assertEqual(main._format_days_in_unit(42, 1), "42")
+
+    def test_week_unit_divides_and_rounds_to_one_decimal(self):
+        self.assertEqual(main._format_days_in_unit(42, 7), "6.0")
+        self.assertEqual(main._format_days_in_unit(10, 7), "1.4")
+
+    def test_month_unit_divides_and_rounds_to_one_decimal(self):
+        self.assertEqual(main._format_days_in_unit(90, 30), "3.0")
+
+
 class TestValidateSessionFields(unittest.TestCase):
     def setUp(self):
         self.db, self.tmpdir = _make_test_db()
@@ -253,6 +353,16 @@ class TestDatabase(unittest.TestCase):
         self.db.insert_session(None, "Reading", None, 30, "2026-07-02", None)
         self.assertEqual(self.db.distinct_languages(), ["ja"])
 
+    def test_language_time_stats_none_when_no_sessions(self):
+        self.assertIsNone(self.db.language_time_stats("ja"))
+
+    def test_language_time_stats_aggregates_across_sessions(self):
+        self.db.insert_session("ja", "Reading", None, 30, "2026-07-01", None)
+        self.db.insert_session("ja", "Listening", None, 45, "2026-07-05", None)
+        self.db.insert_session("ko", "Reading", None, 10, "2026-07-01", None)
+        stats = self.db.language_time_stats("ja")
+        self.assertEqual(stats, (75, "2026-07-01", "2026-07-05", 2))
+
     def test_template_round_trip_and_duplicate_name_rejected(self):
         self.db.insert_template("anki-15", "ja", "Vocabulary", "Flashcards (Anki)", 15, None)
         self.assertEqual([t[1] for t in self.db.get_templates()], ["anki-15"])
@@ -343,6 +453,146 @@ class TestSortTreeview(unittest.TestCase):
         main._sort_treeview(tree, "name", state, reverse=True)
         self.assertTrue(state["reverse"])
         self.assertEqual([tree.set(i, "name") for i in tree.get_children()], ["b", "a"])
+
+
+@unittest.skipUnless(os.environ.get("DISPLAY"), "no DISPLAY available for Tkinter widget tests")
+class TestProjectionTabPaceSlider(unittest.TestCase):
+    """The Projection tab's Day/Week/Month slider re-scales the displayed
+    pace figure and, on both sub-tabs, re-expresses the remaining/needed
+    duration in the chosen unit (e.g. weeks instead of days)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = main.tk.Tk()
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.root.destroy()
+
+    def setUp(self):
+        self.db, self.tmpdir = _make_test_db()
+        # A single 60-minute session on one day -> an unambiguous 60 min/day pace.
+        # Japanese is FSI category IV (hours_est=2200), so A1 needs 137.5 hours.
+        self.db.insert_session("ja", "Reading", None, 60, "2026-01-01", None)
+        self.tab = main.ProjectionTab(self.root, self.db)
+        self.tab.var_lang.set("Japanese (ja)")
+        self.tab._populate()
+
+    def tearDown(self):
+        self.tab.destroy()
+        self.db.conn.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _first_row(self, tree, column):
+        return tree.set(tree.get_children()[0], column)
+
+    def test_default_unit_is_day(self):
+        self.assertEqual(self.tab.tree.heading("pace")["text"], "Your Avg/Day")
+        self.assertEqual(self.tab.tree.heading("days_remaining")["text"], "Days Remaining")
+        self.assertEqual(self._first_row(self.tab.tree, "pace"), main._fmt_time(60))
+        self.assertEqual(self._first_row(self.tab.tree, "days_remaining"), "137")
+
+    def test_week_scales_pace_and_days_remaining(self):
+        self.tab.var_unit_idx.set(1)
+        self.tab._on_unit_change()
+        self.assertEqual(self.tab.tree.heading("pace")["text"], "Your Avg/Week")
+        self.assertEqual(self.tab.tree.heading("days_remaining")["text"], "Weeks Remaining")
+        self.assertEqual(self._first_row(self.tab.tree, "pace"), main._fmt_time(60 * 7))
+        self.assertEqual(self._first_row(self.tab.tree, "days_remaining"), "19.6")
+
+    def test_month_scales_pace_and_days_remaining(self):
+        self.tab.var_unit_idx.set(2)
+        self.tab._on_unit_change()
+        self.assertEqual(self.tab.tree.heading("pace")["text"], "Your Avg/Month")
+        self.assertEqual(self.tab.tree.heading("days_remaining")["text"], "Months Remaining")
+        self.assertEqual(self._first_row(self.tab.tree, "pace"), main._fmt_time(60 * 30))
+        self.assertEqual(self._first_row(self.tab.tree, "days_remaining"), "4.6")
+
+    def test_year_scales_pace_and_days_remaining(self):
+        self.tab.var_unit_idx.set(3)
+        self.tab._on_unit_change()
+        self.assertEqual(self.tab.tree.heading("pace")["text"], "Your Avg/Year")
+        self.assertEqual(self.tab.tree.heading("days_remaining")["text"], "Years Remaining")
+        self.assertEqual(self._first_row(self.tab.tree, "pace"), main._fmt_time(60 * 365))
+        self.assertEqual(self._first_row(self.tab.tree, "days_remaining"), "0.4")
+
+    def test_target_date_unaffected_by_unit(self):
+        target_at_day = self._first_row(self.tab.tree, "target_date")
+        self.tab.var_unit_idx.set(1)
+        self.tab._on_unit_change()
+        self.assertEqual(self._first_row(self.tab.tree, "target_date"), target_at_day)
+
+    def test_incremental_tab_default_unit_is_day(self):
+        tree = self.tab.tree_incremental
+        self.assertEqual(tree.heading("pace2")["text"], "Your Avg/Day")
+        self.assertEqual(tree.heading("days_needed")["text"], "Days Needed")
+        self.assertEqual(self._first_row(tree, "words_added"), "+500")
+        self.assertEqual(self._first_row(tree, "hours_added"), "+138")
+        self.assertEqual(self._first_row(tree, "days_needed"), "138")
+
+    def test_incremental_tab_scales_with_unit(self):
+        self.tab.var_unit_idx.set(1)
+        self.tab._on_unit_change()
+        tree = self.tab.tree_incremental
+        self.assertEqual(tree.heading("pace2")["text"], "Your Avg/Week")
+        self.assertEqual(tree.heading("days_needed")["text"], "Weeks Needed")
+        self.assertEqual(self._first_row(tree, "days_needed"), "19.7")
+
+
+@unittest.skipUnless(os.environ.get("DISPLAY"), "no DISPLAY available for Tkinter widget tests")
+class TestProjectionTabNativeSystems(unittest.TestCase):
+    """Languages with their own scale (HSK/JLPT/TOPIK) should show those
+    levels alongside CEFR in both Projection sub-tabs; languages without one
+    should only show CEFR."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = main.tk.Tk()
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.root.destroy()
+
+    def setUp(self):
+        self.db, self.tmpdir = _make_test_db()
+
+    def tearDown(self):
+        self.tab.destroy()
+        self.db.conn.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _systems_shown(self, lang_display):
+        self.tab = main.ProjectionTab(self.root, self.db)
+        self.tab.var_lang.set(lang_display)
+        self.tab._populate()
+        to_level     = {self.tab.tree.set(i, "system") for i in self.tab.tree.get_children()}
+        incremental  = {self.tab.tree_incremental.set(i, "system") for i in self.tab.tree_incremental.get_children()}
+        return to_level, incremental
+
+    def test_japanese_shows_cefr_and_jlpt(self):
+        self.db.insert_session("ja", "Reading", None, 60, "2026-01-01", None)
+        to_level, incremental = self._systems_shown("Japanese (ja)")
+        self.assertEqual(to_level, {"CEFR", "JLPT"})
+        self.assertEqual(incremental, {"CEFR", "JLPT"})
+
+    def test_spanish_shows_only_cefr(self):
+        self.db.insert_session("es", "Reading", None, 60, "2026-01-01", None)
+        to_level, incremental = self._systems_shown("Spanish (es)")
+        self.assertEqual(to_level, {"CEFR"})
+        self.assertEqual(incremental, {"CEFR"})
+
+    def test_jlpt_rows_use_jlpt_level_labels_and_word_counts(self):
+        self.db.insert_session("ja", "Reading", None, 60, "2026-01-01", None)
+        self._systems_shown("Japanese (ja)")
+        jlpt_words = {
+            self.tab.tree.set(i, "level"): self.tab.tree.set(i, "words")
+            for i in self.tab.tree.get_children()
+            if self.tab.tree.set(i, "system") == "JLPT"
+        }
+        self.assertEqual(jlpt_words["N5"], "~800")
+        self.assertEqual(jlpt_words["N1"], "~10,000")
 
 
 class TestCliSmoke(unittest.TestCase):

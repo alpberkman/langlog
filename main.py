@@ -7,6 +7,7 @@ import csv
 import os
 import sys
 import argparse
+import math
 import threading
 import time
 import calendar
@@ -76,10 +77,10 @@ _CHART_COLORS = [
 # speakers, and roughly how long each takes to reach professional working
 # proficiency in a classroom setting.
 FSI_CATEGORIES = {
-    "I":   {"hours": "600-750",  "weeks": "24-30", "desc": "Languages closely related to English"},
-    "II":  {"hours": "900",      "weeks": "36",    "desc": "Similar languages"},
-    "III": {"hours": "1100",     "weeks": "44",    "desc": "Languages with significant linguistic/cultural differences"},
-    "IV":  {"hours": "2200",     "weeks": "88",    "desc": "Exceptionally difficult for English speakers"},
+    "I":   {"hours": "600-750",  "hours_est": 675,  "weeks": "24-30", "desc": "Languages closely related to English"},
+    "II":  {"hours": "900",      "hours_est": 900,  "weeks": "36",    "desc": "Similar languages"},
+    "III": {"hours": "1100",     "hours_est": 1100, "weeks": "44",    "desc": "Languages with significant linguistic/cultural differences"},
+    "IV":  {"hours": "2200",     "hours_est": 2200, "weeks": "88",    "desc": "Exceptionally difficult for English speakers"},
 }
 
 # code -> (FSI category, is_estimated). is_estimated=True means the language is
@@ -233,6 +234,98 @@ def _load_chart_context(db: "Database", filter_bar: "FilterBar"):
     prepared = _prepare_chart_data(rows, start_date, end_date, filter_bar.grouping,
                                     user_colors=db.get_activity_colors())
     return rows, prepared
+
+
+def _summary_line(rows, p_keys, grouping: str) -> str:
+    """Shared summary strip for Stats and Cumulative: session count, total
+    time, average session length, average time per displayed period (including
+    periods with no logged time), and the top activity by total duration."""
+    total_sessions = len(rows)
+    total_min      = sum(dur for _, _, dur in rows)
+    act_totals     = defaultdict(float)
+    for _, act, dur in rows:
+        act_totals[act] += dur
+    top_act        = max(act_totals, key=act_totals.get)
+    avg_per_period = total_min / len(p_keys) if p_keys else 0
+    return (
+        f"Sessions: {total_sessions}   ·   Total: {_fmt_time(total_min)}   ·   "
+        f"Avg session: {_fmt_time(total_min / total_sessions)}   ·   "
+        f"Avg per {grouping}: {_fmt_time(avg_per_period)}   ·   Top activity: {top_act}"
+    )
+
+
+_ProjectedLevel = namedtuple(
+    "_ProjectedLevel", ["level", "words", "hours_needed", "days_remaining", "target_date"]
+)
+
+
+_CEFR_C1_WORDS = dict(CEFR_WORD_COUNTS)["C1"]
+
+
+def _project_levels(total_minutes, first_date_str, last_date_str, fsi_category,
+                     word_counts=CEFR_WORD_COUNTS, today=None):
+    """Projects, for one language, how many more calendar days of study it
+    would take to reach each level in `word_counts` (CEFR by default, or a
+    language's own scale, e.g. HSK/JLPT/TOPIK) — assuming the historical
+    average daily pace (total_minutes spread over first_date_str..last_date_str
+    inclusive) continues, and that study time converts to vocabulary at a
+    constant rate. Hours needed per level are scaled off the language's FSI
+    category hours, anchored so CEFR C1's word count == the FSI "professional
+    working proficiency" hour estimate — the same anchor is used regardless of
+    which `word_counts` table is passed in, so HSK/JLPT/TOPIK levels are rated
+    on the same hours-per-word rate as CEFR. `days_remaining`/`target_date`
+    are None for levels whose hours estimate is already met.
+
+    Returns a list of `_ProjectedLevel(level, words, hours_needed,
+    days_remaining, target_date)`, one per level in `word_counts`, ascending."""
+    today = today or date.today()
+    first_date = datetime.strptime(first_date_str, "%Y-%m-%d").date()
+    last_date  = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+    span_days  = (last_date - first_date).days + 1
+    avg_daily_minutes = total_minutes / span_days
+    hours_studied = total_minutes / 60
+    hours_at_c1   = FSI_CATEGORIES[fsi_category]["hours_est"]
+
+    results = []
+    for level, words in word_counts:
+        hours_needed = hours_at_c1 * (words / _CEFR_C1_WORDS)
+        if hours_studied >= hours_needed:
+            results.append(_ProjectedLevel(level, words, hours_needed, None, None))
+        else:
+            remaining_hours  = hours_needed - hours_studied
+            days_remaining   = math.ceil(remaining_hours * 60 / avg_daily_minutes)
+            target_date      = today + timedelta(days=days_remaining)
+            results.append(_ProjectedLevel(level, words, hours_needed, days_remaining, target_date))
+    return results
+
+
+_IncrementalLevel = namedtuple("_IncrementalLevel", ["level", "words_added", "hours_added"])
+
+
+def _incremental_levels(fsi_category, word_counts=CEFR_WORD_COUNTS):
+    """The incremental vocabulary/hours needed to go from each level in
+    `word_counts` to the next (from 0 for the first level) — a fixed
+    reference independent of anyone's actual progress, using the same
+    hours-needed scaling as _project_levels.
+    Returns a list of `_IncrementalLevel(level, words_added, hours_added)`."""
+    hours_at_c1 = FSI_CATEGORIES[fsi_category]["hours_est"]
+
+    results = []
+    prev_words, prev_hours = 0, 0.0
+    for level, words in word_counts:
+        hours_needed = hours_at_c1 * (words / _CEFR_C1_WORDS)
+        results.append(_IncrementalLevel(level, words - prev_words, hours_needed - prev_hours))
+        prev_words, prev_hours = words, hours_needed
+    return results
+
+
+def _format_days_in_unit(days: int, unit_multiplier: int) -> str:
+    """Formats a day-count in the given unit (1=days, 7=weeks, 30=months, ...).
+    Whole days display as an integer; larger units display with one decimal
+    place since fractional weeks/months are meaningful."""
+    if unit_multiplier <= 1:
+        return str(days)
+    return f"{days / unit_multiplier:.1f}"
 
 
 def _validate_session_fields(lang_display, activity_type, dur_raw, date_str, db, parent=None):
@@ -478,6 +571,16 @@ class Database:
         return [r[0] for r in self.conn.execute(
             "SELECT DISTINCT activity_type FROM sessions ORDER BY activity_type"
         ).fetchall()]
+
+    def language_time_stats(self, lang_code: str):
+        """Returns (total_minutes, first_date, last_date, session_count) for
+        the given language code, or None if no sessions are logged for it."""
+        row = self.conn.execute(
+            "SELECT SUM(duration_minutes), MIN(date), MAX(date), COUNT(*) "
+            "FROM sessions WHERE language = ?",
+            (lang_code,),
+        ).fetchone()
+        return row if row[0] is not None else None
 
     # ---------- templates ----------
 
@@ -800,6 +903,7 @@ class LogTab(ttk.Frame):
         frame = ttk.Frame(self, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(8, weight=1)
 
         def lbl(text, r):
             ttk.Label(frame, text=text).grid(row=r, column=0, sticky=tk.W, pady=6, padx=(0, 12))
@@ -861,8 +965,9 @@ class LogTab(ttk.Frame):
             row=7, column=0, columnspan=3, sticky=tk.EW, pady=(14, 0)
         )
         tmpl_lf = ttk.LabelFrame(frame, text=" Saved Templates ", padding=(8, 6))
-        tmpl_lf.grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
+        tmpl_lf.grid(row=8, column=0, columnspan=3, sticky=tk.NSEW, pady=(4, 0))
         tmpl_lf.columnconfigure(0, weight=1)
+        tmpl_lf.rowconfigure(0, weight=1)
 
         self.tmpl_canvas = tk.Canvas(tmpl_lf, highlightthickness=0)
         tmpl_vsb = ttk.Scrollbar(tmpl_lf, orient=tk.VERTICAL, command=self.tmpl_canvas.yview)
@@ -1383,16 +1488,21 @@ class StatsTab(ttk.Frame):
     def _build(self):
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
-        frame.rowconfigure(1, weight=1)
+        frame.rowconfigure(2, weight=1)
         frame.columnconfigure(0, weight=1)
         self._chart_parent = frame
 
         self.filter_bar = FilterBar(frame, self.db, on_refresh=self.refresh)
-        self.filter_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        self.filter_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 4))
+
+        self.var_summary = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.var_summary, foreground="#555555", anchor=tk.W).grid(
+            row=1, column=0, sticky=tk.EW, padx=2, pady=(0, 4)
+        )
 
     def _init_chart(self):
         self.fig, self.canvas = _build_mpl_frame(
-            self._chart_parent, canvas_row=1,
+            self._chart_parent, canvas_row=2,
             left=0.08, right=0.95, bottom=0.15, top=0.88, wspace=0.4,
         )
 
@@ -1415,6 +1525,7 @@ class StatsTab(ttk.Frame):
         ax_pie = self.fig.add_subplot(1, 2, 2)
 
         if prepared is None:
+            self.var_summary.set("No data in the selected range.")
             for ax in (ax_bar, ax_pie):
                 ax.text(0.5, 0.5, "No data yet", ha="center", va="center",
                         transform=ax.transAxes, fontsize=12, color="gray")
@@ -1423,6 +1534,7 @@ class StatsTab(ttk.Frame):
             return
 
         all_acts, color_map, p_keys, p_labels, by_act_period = prepared
+        self.var_summary.set(_summary_line(rows, p_keys, grouping))
 
         # Stacked bar chart
         x       = list(range(len(p_keys)))
@@ -1431,6 +1543,12 @@ class StatsTab(ttk.Frame):
             vals = [by_act_period[act].get(k, 0.0) for k in p_keys]
             ax_bar.bar(x, vals, bottom=bottoms, label=act, color=color_map[act])
             bottoms = [b + v for b, v in zip(bottoms, vals)]
+
+        avg_per_period_hours = sum(bottoms) / len(bottoms) if bottoms else 0.0
+        ax_bar.axhline(
+            avg_per_period_hours, color="#333333", linestyle="--", linewidth=1.2,
+            label=f"Avg: {_fmt_time(avg_per_period_hours * 60)}",
+        )
 
         ax_bar.set_xticks(x)
         label_fs = max(5, min(8, 80 // max(len(p_keys), 1)))
@@ -1520,18 +1638,7 @@ class CumulativeTab(ttk.Frame):
             return
 
         all_acts, color_map, p_keys, p_labels, by_act_period = prepared
-
-        # Summary
-        total_sessions = len(rows)
-        total_min      = sum(dur for _, _, dur in rows)
-        act_totals     = defaultdict(float)
-        for _, act, dur in rows:
-            act_totals[act] += dur
-        top_act = max(act_totals, key=act_totals.get)
-        self.var_summary.set(
-            f"Sessions: {total_sessions}   ·   Total: {_fmt_time(total_min)}   ·   "
-            f"Avg session: {_fmt_time(total_min / total_sessions)}   ·   Top activity: {top_act}"
-        )
+        self.var_summary.set(_summary_line(rows, p_keys, grouping))
 
         # Cumulative series
         cumul   = {act: [] for act in all_acts}
@@ -1723,7 +1830,207 @@ class VocabTab(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
-# Tab 7 — Settings
+# Tab 7 — Projection
+# ---------------------------------------------------------------------------
+
+class ProjectionTab(ttk.Frame):
+    """For each language you've actually logged sessions for, projects how
+    many more days of study — at your historical average daily pace for that
+    language — it would take to reach each CEFR level, plus a breakdown of
+    the incremental effort each level-up step takes on its own."""
+
+    # (singular label, plural label, days-per-unit)
+    _PACE_UNITS = [("Day", "Days", 1), ("Week", "Weeks", 7), ("Month", "Months", 30), ("Year", "Years", 365)]
+
+    def __init__(self, parent, db: Database):
+        super().__init__(parent)
+        self.db = db
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(4, weight=1)
+
+        ttk.Label(
+            frame,
+            text=("Projects how many more days of study it would take to reach each CEFR level "
+                  "(plus HSK/JLPT/TOPIK where the language has its own scale), using your historical "
+                  "average daily pace for that language (total logged minutes spread over the days "
+                  "since your first session) and the same FSI/CEFR estimates as the Learning Time and "
+                  "Vocabulary tabs. Rough approximation only — assumes your past pace continues and "
+                  "that study time converts to vocabulary at a constant rate."),
+            foreground="gray", wraplength=860, justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
+
+        filter_row = ttk.Frame(frame)
+        filter_row.grid(row=1, column=0, sticky=tk.W, pady=(0, 4))
+        ttk.Label(filter_row, text="Language:").pack(side=tk.LEFT)
+        self.var_lang = tk.StringVar(value="All")
+        self.cb_lang = ttk.Combobox(filter_row, textvariable=self.var_lang, state="readonly", width=30)
+        self.cb_lang.pack(side=tk.LEFT, padx=(4, 0))
+        self.cb_lang.bind("<<ComboboxSelected>>", lambda e: self._populate())
+
+        pace_row = ttk.Frame(frame)
+        pace_row.grid(row=2, column=0, sticky=tk.W, pady=(0, 4))
+        ttk.Label(pace_row, text="Show pace/duration per:").pack(side=tk.LEFT)
+        self.var_unit_idx = tk.IntVar(value=0)
+        tk.Scale(
+            pace_row, from_=0, to=len(self._PACE_UNITS) - 1, resolution=1,
+            orient=tk.HORIZONTAL, showvalue=False, length=160, sliderlength=20,
+            variable=self.var_unit_idx, command=self._on_unit_change,
+        ).pack(side=tk.LEFT, padx=(6, 6))
+        self.lbl_unit = ttk.Label(pace_row, text=self._PACE_UNITS[0][0], width=6)
+        self.lbl_unit.pack(side=tk.LEFT)
+
+        self.var_status = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.var_status, foreground="#555555", anchor=tk.W).grid(
+            row=3, column=0, sticky=tk.EW, padx=2, pady=(0, 4)
+        )
+
+        sub = ttk.Notebook(frame)
+        sub.grid(row=4, column=0, columnspan=2, sticky=tk.NSEW)
+
+        to_level_frame = ttk.Frame(sub)
+        sub.add(to_level_frame, text="  To Reach Level  ")
+        to_level_frame.columnconfigure(0, weight=1)
+        to_level_frame.rowconfigure(0, weight=1)
+
+        columns = ("language", "system", "level", "words", "hours_needed", "pace", "days_remaining", "target_date")
+        self.tree = ttk.Treeview(to_level_frame, columns=columns, show="headings", selectmode="browse")
+        col_cfg = [
+            ("language",       "Language",         140),
+            ("system",         "System",           70),
+            ("level",          "Level",            90),
+            ("words",          "Est. Words",       90),
+            ("hours_needed",   "Est. Hours",       90),
+            ("pace",           "Your Avg/Day",     100),
+            ("days_remaining", "Days Remaining",   110),
+            ("target_date",    "Est. Target Date", 130),
+        ]
+        for col_id, heading, width in col_cfg:
+            self.tree.heading(col_id, text=heading)
+            self.tree.column(col_id, width=width, anchor=tk.W)
+        vsb = ttk.Scrollbar(to_level_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky=tk.NSEW)
+        vsb.grid(row=0, column=1, sticky=tk.NS)
+        self.tree.tag_configure("reached", background="#dcf0dc")
+
+        per_level_frame = ttk.Frame(sub)
+        sub.add(per_level_frame, text="  Per-Level Effort  ")
+        per_level_frame.columnconfigure(0, weight=1)
+        per_level_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            per_level_frame,
+            text=("Effort to go from the previous level to each one on its own — not cumulative from "
+                  "scratch, and not tied to how far along you already are."),
+            foreground="gray", wraplength=860, justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(8, 6), padx=2)
+
+        columns2 = ("language", "system", "level", "words_added", "hours_added", "pace2", "days_needed")
+        self.tree_incremental = ttk.Treeview(
+            per_level_frame, columns=columns2, show="headings", selectmode="browse"
+        )
+        col_cfg2 = [
+            ("language",    "Language",       140),
+            ("system",      "System",         70),
+            ("level",       "Level",          90),
+            ("words_added", "Words Added",    100),
+            ("hours_added", "Hours Added",    100),
+            ("pace2",       "Your Avg/Day",   100),
+            ("days_needed", "Days Needed",    110),
+        ]
+        for col_id, heading, width in col_cfg2:
+            self.tree_incremental.heading(col_id, text=heading)
+            self.tree_incremental.column(col_id, width=width, anchor=tk.W)
+        vsb2 = ttk.Scrollbar(per_level_frame, orient=tk.VERTICAL, command=self.tree_incremental.yview)
+        self.tree_incremental.configure(yscrollcommand=vsb2.set)
+        self.tree_incremental.grid(row=1, column=0, sticky=tk.NSEW)
+        vsb2.grid(row=1, column=1, sticky=tk.NS)
+
+        self.refresh()
+
+    def _studied_codes(self):
+        # Only languages both logged and rated in LANGUAGE_DIFFICULTY (excludes "en").
+        return [c for c in self.db.distinct_languages() if c in LANGUAGE_DIFFICULTY]
+
+    def _on_unit_change(self, _value=None):
+        unit_name, unit_plural, _mult = self._PACE_UNITS[self.var_unit_idx.get()]
+        self.lbl_unit.config(text=unit_name)
+        self.tree.heading("pace", text=f"Your Avg/{unit_name}")
+        self.tree.heading("days_remaining", text=f"{unit_plural} Remaining")
+        self.tree_incremental.heading("pace2", text=f"Your Avg/{unit_name}")
+        self.tree_incremental.heading("days_needed", text=f"{unit_plural} Needed")
+        self._populate()
+
+    def refresh(self):
+        options = [_lang_display(c) for c in self._studied_codes()]
+        self.cb_lang["values"] = ["All"] + options
+        if self.var_lang.get() not in self.cb_lang["values"]:
+            self.var_lang.set("All")
+        self._populate()
+
+    def _populate(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for item in self.tree_incremental.get_children():
+            self.tree_incremental.delete(item)
+
+        studied = self._studied_codes()
+        if not studied:
+            self.var_status.set("No sessions logged yet for a rated language — log some practice to see projections.")
+            return
+
+        selected = self.var_lang.get()
+        codes = studied if selected == "All" else [_extract_lang_code(selected)]
+        self.var_status.set("")
+        _unit_name, _unit_plural, unit_multiplier = self._PACE_UNITS[self.var_unit_idx.get()]
+
+        for code in codes:
+            total_minutes, first_date, last_date, _count = self.db.language_time_stats(code)
+            category, _estimated = LANGUAGE_DIFFICULTY[code]
+            name = _lang_display(code) or code
+            span_days = (datetime.strptime(last_date, "%Y-%m-%d").date()
+                         - datetime.strptime(first_date, "%Y-%m-%d").date()).days + 1
+            avg_daily_minutes = total_minutes / span_days
+            pace_display = _fmt_time(avg_daily_minutes * unit_multiplier)
+
+            systems = [("CEFR", CEFR_WORD_COUNTS)]
+            native = NATIVE_LEVEL_SYSTEMS.get(code)
+            if native:
+                systems.append(native)
+
+            for system_name, word_counts in systems:
+                for level, words, hours_needed, days_remaining, target_date in _project_levels(
+                    total_minutes, first_date, last_date, category, word_counts=word_counts
+                ):
+                    if days_remaining is None:
+                        tags, days_display, target_display = ("reached",), "Reached", "Already reached (est.)"
+                    else:
+                        tags = ()
+                        days_display   = _format_days_in_unit(days_remaining, unit_multiplier)
+                        target_display = target_date.isoformat()
+                    self.tree.insert(
+                        "", tk.END,
+                        values=(name, system_name, level, f"~{words:,}", f"~{hours_needed:.0f}",
+                                pace_display, days_display, target_display),
+                        tags=tags,
+                    )
+
+                for level, words_added, hours_added in _incremental_levels(category, word_counts=word_counts):
+                    days_needed = math.ceil(hours_added * 60 / avg_daily_minutes)
+                    self.tree_incremental.insert(
+                        "", tk.END,
+                        values=(name, system_name, level, f"+{words_added:,}", f"+{hours_added:.0f}",
+                                pace_display, _format_days_in_unit(days_needed, unit_multiplier)),
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Tab 8 — Settings
 # ---------------------------------------------------------------------------
 
 class SettingsTab(ttk.Frame):
@@ -2014,23 +2321,25 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.tab_log       = LogTab(self.notebook, db)
-        self.tab_timer     = TimerTab(self.notebook, self.tab_log)
-        self.tab_history   = HistoryTab(self.notebook, db)
-        self.tab_stats     = StatsTab(self.notebook, db)
-        self.tab_cumul     = CumulativeTab(self.notebook, db)
-        self.tab_learntime = LearningTimeTab(self.notebook, db)
-        self.tab_vocab     = VocabTab(self.notebook, db)
-        self.tab_settings  = SettingsTab(self.notebook, db, on_prefs_changed=self._on_prefs_changed)
+        self.tab_log        = LogTab(self.notebook, db)
+        self.tab_timer      = TimerTab(self.notebook, self.tab_log)
+        self.tab_history    = HistoryTab(self.notebook, db)
+        self.tab_stats      = StatsTab(self.notebook, db)
+        self.tab_cumul      = CumulativeTab(self.notebook, db)
+        self.tab_learntime  = LearningTimeTab(self.notebook, db)
+        self.tab_vocab      = VocabTab(self.notebook, db)
+        self.tab_projection = ProjectionTab(self.notebook, db)
+        self.tab_settings   = SettingsTab(self.notebook, db, on_prefs_changed=self._on_prefs_changed)
 
-        self.notebook.add(self.tab_log,       text="  Log Session  ")
-        self.notebook.add(self.tab_history,   text="  History  ")
-        self.notebook.add(self.tab_stats,     text="  Stats  ")
-        self.notebook.add(self.tab_cumul,     text="  Cumulative  ")
-        self.notebook.add(self.tab_learntime, text="  Learning Time  ")
-        self.notebook.add(self.tab_vocab,     text="  Vocabulary  ")
-        self.notebook.add(self.tab_settings,  text="  Settings  ")
-        self.notebook.add(self.tab_timer,     text="  Timer  ")
+        self.notebook.add(self.tab_log,        text="  Log Session  ")
+        self.notebook.add(self.tab_history,    text="  History  ")
+        self.notebook.add(self.tab_stats,      text="  Stats  ")
+        self.notebook.add(self.tab_cumul,      text="  Cumulative  ")
+        self.notebook.add(self.tab_learntime,  text="  Learning Time  ")
+        self.notebook.add(self.tab_vocab,      text="  Vocabulary  ")
+        self.notebook.add(self.tab_projection, text="  Projection  ")
+        self.notebook.add(self.tab_settings,   text="  Settings  ")
+        self.notebook.add(self.tab_timer,      text="  Timer  ")
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
         self.bind("<Control-s>", self._on_ctrl_s)
@@ -2058,6 +2367,8 @@ class LanguageLoggerApp(tk.Tk):
             self.tab_cumul.refresh()
         elif selected == str(self.tab_learntime):
             self.tab_learntime.refresh()
+        elif selected == str(self.tab_projection):
+            self.tab_projection.refresh()
 
 
 def _cli_list_templates():
