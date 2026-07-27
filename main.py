@@ -274,7 +274,11 @@ def _project_levels(total_minutes, first_date_str, last_date_str, fsi_category,
     working proficiency" hour estimate — the same anchor is used regardless of
     which `word_counts` table is passed in, so HSK/JLPT/TOPIK levels are rated
     on the same hours-per-word rate as CEFR. `days_remaining`/`target_date`
-    are None for levels whose hours estimate is already met.
+    are both None for levels whose hours estimate is already met. If the
+    historical pace is so slow that the projected date would fall outside
+    `datetime.date`'s range, `target_date` is None but `days_remaining` is
+    still the (very large) day count, so callers can tell "already reached"
+    apart from "not estimable".
 
     Returns a list of `_ProjectedLevel(level, words, hours_needed,
     days_remaining, target_date)`, one per level in `word_counts`, ascending."""
@@ -294,7 +298,10 @@ def _project_levels(total_minutes, first_date_str, last_date_str, fsi_category,
         else:
             remaining_hours  = hours_needed - hours_studied
             days_remaining   = math.ceil(remaining_hours * 60 / avg_daily_minutes)
-            target_date      = today + timedelta(days=days_remaining)
+            try:
+                target_date = today + timedelta(days=days_remaining)
+            except OverflowError:
+                target_date = None
             results.append(_ProjectedLevel(level, words, hours_needed, days_remaining, target_date))
     return results
 
@@ -2009,6 +2016,10 @@ class ProjectionTab(ttk.Frame):
                 ):
                     if days_remaining is None:
                         tags, days_display, target_display = ("reached",), "Reached", "Already reached (est.)"
+                    elif target_date is None:
+                        tags = ()
+                        days_display   = _format_days_in_unit(days_remaining, unit_multiplier)
+                        target_display = "Not estimable"
                     else:
                         tags = ()
                         days_display   = _format_days_in_unit(days_remaining, unit_multiplier)

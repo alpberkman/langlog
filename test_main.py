@@ -195,6 +195,18 @@ class TestProjectLevels(unittest.TestCase):
         self.assertIsNotNone(levels["C2"].days_remaining)
         self.assertIsNotNone(levels["C2"].target_date)
 
+    def test_target_date_none_but_days_remaining_set_when_pace_too_slow_to_estimate(self):
+        # A single logged minute spread over 20 years of history is a tiny enough
+        # pace that the projected target date overflows datetime.date's range.
+        results = main._project_levels(
+            total_minutes=1, first_date_str="2000-01-01", last_date_str="2020-01-01",
+            fsi_category="IV", today=date(2020, 1, 1),
+        )
+        c1 = next(r for r in results if r.level == "C1")
+        self.assertIsNone(c1.target_date)
+        self.assertIsNotNone(c1.days_remaining)
+        self.assertGreater(c1.days_remaining, 365 * 1000)
+
 
 class TestIncrementalLevels(unittest.TestCase):
     def test_first_level_added_equals_its_own_total(self):
@@ -538,6 +550,15 @@ class TestProjectionTabPaceSlider(unittest.TestCase):
         self.assertEqual(tree.heading("pace2")["text"], "Your Avg/Week")
         self.assertEqual(tree.heading("days_needed")["text"], "Weeks Needed")
         self.assertEqual(self._first_row(tree, "days_needed"), "19.7")
+
+    def test_target_date_shows_not_estimable_when_pace_too_slow(self):
+        # Overwrite the default session with one minute spread across 20 years,
+        # slow enough that the projected date overflows datetime.date's range.
+        self.db.conn.execute("DELETE FROM sessions")
+        self.db.insert_session("ja", "Reading", None, 1, "2000-01-01", None)
+        self.db.insert_session("ja", "Reading", None, 0, "2020-01-01", None)
+        self.tab._populate()
+        self.assertEqual(self._first_row(self.tab.tree, "target_date"), "Not estimable")
 
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "no DISPLAY available for Tkinter widget tests")
