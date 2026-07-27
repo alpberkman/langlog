@@ -402,7 +402,9 @@ def _sort_treeview(tree: ttk.Treeview, column: str, state: dict, numeric_columns
 
 class Database:
     def __init__(self, path: str):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self._init_schema()
         self._seed_prefs()
@@ -701,10 +703,12 @@ class FilterBar(ttk.Frame):
 
         ttk.Label(self, text="By:").pack(side=tk.LEFT)
         self.var_groupby = tk.StringVar(value="Week")
-        ttk.Combobox(
+        cb_groupby = ttk.Combobox(
             self, textvariable=self.var_groupby,
             values=["Day", "Week", "Month"], width=6, state="readonly",
-        ).pack(side=tk.LEFT, padx=(4, 10))
+        )
+        cb_groupby.pack(side=tk.LEFT, padx=(4, 10))
+        cb_groupby.bind("<<ComboboxSelected>>", lambda e: self._on_refresh())
 
         ttk.Label(self, text="Quick:").pack(side=tk.LEFT)
         self.var_preset = tk.StringVar()
@@ -1035,9 +1039,13 @@ class LogTab(ttk.Frame):
         specific      = self.var_specific.get().strip() or None
         notes         = self.txt_notes.get("1.0", tk.END).strip() or None
         date_str      = self.var_date.get().strip()
+        try:
+            dur_raw = self.var_duration.get()
+        except tk.TclError:
+            dur_raw = ""
 
         result = _validate_session_fields(
-            lang_display, activity_type, self.var_duration.get(), date_str, self.db
+            lang_display, activity_type, dur_raw, date_str, self.db
         )
         if result is None:
             return
@@ -1249,7 +1257,7 @@ class HistoryTab(ttk.Frame):
         ttk.Label(fbar, text="Language:").pack(side=tk.LEFT)
         self.var_lang = tk.StringVar(value="All")
         self.cb_lang = ttk.Combobox(
-            fbar, textvariable=self.var_lang, values=["All"], width=20, state="readonly"
+            fbar, textvariable=self.var_lang, values=["All", "(No language)"], width=20, state="readonly"
         )
         self.cb_lang.pack(side=tk.LEFT, padx=(4, 12))
         self.cb_lang.bind("<<ComboboxSelected>>", lambda e: self.refresh())
@@ -1303,7 +1311,11 @@ class HistoryTab(ttk.Frame):
 
     def _lang_code_filter(self):
         v = self.var_lang.get()
-        return None if v == "All" else _extract_lang_code(v)
+        if v == "All":
+            return None
+        if v == "(No language)":
+            return ""
+        return _extract_lang_code(v)
 
     def _activity_filter(self):
         v = self.var_act.get()
@@ -1311,7 +1323,7 @@ class HistoryTab(ttk.Frame):
 
     def refresh(self):
         lang_codes = self.db.distinct_languages()
-        lang_opts  = ["All"] + [_lang_display(c) for c in lang_codes]
+        lang_opts  = ["All", "(No language)"] + [_lang_display(c) for c in lang_codes]
         self.cb_lang["values"] = lang_opts
         self.cb_act["values"]  = ["All"] + self.db.distinct_activities()
 

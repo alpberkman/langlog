@@ -323,6 +323,19 @@ class TestDatabase(unittest.TestCase):
                     "pref_specific_activities", "pref_activity_colors"}
         self.assertTrue(expected <= tables)
 
+    def test_accepts_bare_filename_with_no_directory_component(self):
+        # os.path.dirname("sessions.db") is "" — passing that straight to
+        # os.makedirs used to raise FileNotFoundError, breaking the documented
+        # `python main.py -f sessions.db` workflow (relative, no directory).
+        cwd = os.getcwd()
+        os.chdir(self.tmpdir)
+        try:
+            db = main.Database("bare.db")
+            db.conn.close()
+            self.assertTrue(os.path.isfile(os.path.join(self.tmpdir, "bare.db")))
+        finally:
+            os.chdir(cwd)
+
     def test_fresh_db_has_no_languages_enabled_but_falls_back_to_all(self):
         self.assertEqual(self.db.enabled_lang_codes(), set())
         self.assertEqual(self.db.pref_languages(), main.LANGUAGE_OPTIONS)
