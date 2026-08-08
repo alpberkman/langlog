@@ -127,10 +127,7 @@ NATIVE_LEVEL_SYSTEMS = {
 
 def _fmt_time(total_minutes: float) -> str:
     m = int(round(total_minutes))
-    d, rem = divmod(m, 1440)
-    h, mn  = divmod(rem, 60)
-    if d > 0:
-        return f"{d:02d}:{h:02d}:{mn:02d}"
+    h, mn = divmod(m, 60)
     return f"{h:02d}:{mn:02d}"
 
 
@@ -263,32 +260,50 @@ _CEFR_C1_WORDS = dict(CEFR_WORD_COUNTS)["C1"]
 
 
 def _project_levels(total_minutes, first_date_str, last_date_str, fsi_category,
-                     word_counts=CEFR_WORD_COUNTS, today=None):
+                     word_counts=CEFR_WORD_COUNTS, today=None, assumed_level=None,
+                     avg_daily_minutes=None):
     """Projects, for one language, how many more calendar days of study it
     would take to reach each level in `word_counts` (CEFR by default, or a
-    language's own scale, e.g. HSK/JLPT/TOPIK) — assuming the historical
-    average daily pace (total_minutes spread over first_date_str..last_date_str
-    inclusive) continues, and that study time converts to vocabulary at a
-    constant rate. Hours needed per level are scaled off the language's FSI
-    category hours, anchored so CEFR C1's word count == the FSI "professional
-    working proficiency" hour estimate — the same anchor is used regardless of
-    which `word_counts` table is passed in, so HSK/JLPT/TOPIK levels are rated
-    on the same hours-per-word rate as CEFR. `days_remaining`/`target_date`
-    are both None for levels whose hours estimate is already met. If the
-    historical pace is so slow that the projected date would fall outside
-    `datetime.date`'s range, `target_date` is None but `days_remaining` is
-    still the (very large) day count, so callers can tell "already reached"
-    apart from "not estimable".
+    language's own scale, e.g. HSK/JLPT/TOPIK) — assuming a daily study pace
+    continues, and that study time converts to vocabulary at a constant rate.
+    Hours needed per level are scaled off the language's FSI category hours,
+    anchored so CEFR C1's word count == the FSI "professional working
+    proficiency" hour estimate — the same anchor is used regardless of which
+    `word_counts` table is passed in, so HSK/JLPT/TOPIK levels are rated on
+    the same hours-per-word rate as CEFR. `days_remaining`/`target_date` are
+    both None for levels whose hours estimate is already met. If the pace is
+    so slow that the projected date would fall outside `datetime.date`'s
+    range, `target_date` is None but `days_remaining` is still the (very
+    large) day count, so callers can tell "already reached" apart from "not
+    estimable".
+
+    `avg_daily_minutes`, if given, overrides the historical-pace calculation
+    (total_minutes spread over first_date_str..last_date_str inclusive) with
+    a caller-supplied assumed daily pace instead — e.g. "assume I can study
+    60 min/day going forward" rather than the actual average logged so far.
+
+    `assumed_level`, if given, is a level label from `word_counts` (e.g.
+    "B1") representing where the caller already was *before* they started
+    logging sessions here. Its `hours_needed` is added to `hours_studied` as
+    a starting baseline — so levels at or below it are always "reached", and
+    logged hours accumulate on top of it for levels above it, rather than
+    being compared against it in isolation.
 
     Returns a list of `_ProjectedLevel(level, words, hours_needed,
     days_remaining, target_date)`, one per level in `word_counts`, ascending."""
     today = today or date.today()
     first_date = datetime.strptime(first_date_str, "%Y-%m-%d").date()
     last_date  = datetime.strptime(last_date_str, "%Y-%m-%d").date()
-    span_days  = (last_date - first_date).days + 1
-    avg_daily_minutes = total_minutes / span_days
+    if avg_daily_minutes is None:
+        span_days = (last_date - first_date).days + 1
+        avg_daily_minutes = total_minutes / span_days
     hours_studied = total_minutes / 60
     hours_at_c1   = FSI_CATEGORIES[fsi_category]["hours_est"]
+
+    if assumed_level is not None:
+        words_at_assumed = dict(word_counts).get(assumed_level)
+        if words_at_assumed is not None:
+            hours_studied += hours_at_c1 * (words_at_assumed / _CEFR_C1_WORDS)
 
     results = []
     for level, words in word_counts:
@@ -448,6 +463,12 @@ class Database:
                 activity_type TEXT PRIMARY KEY,
                 color         TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pref_current_level (
+                language TEXT NOT NULL,
+                system   TEXT NOT NULL,
+                level    TEXT NOT NULL,
+                PRIMARY KEY (language, system)
+            );
         """)
         self.conn.commit()
 
@@ -591,6 +612,14 @@ class Database:
         ).fetchone()
         return row if row[0] is not None else None
 
+    def earliest_session_date(self, lang_code=None):
+        """Returns the earliest session date (YYYY-MM-DD) matching lang_code
+        (None = all languages, "" = no-language sessions only), or None if no
+        matching sessions are logged."""
+        where, params = self._build_where(lang_code=lang_code)
+        row = self.conn.execute(f"SELECT MIN(date) FROM sessions {where}", params).fetchone()
+        return row[0]
+
     # ---------- templates ----------
 
     def get_templates(self) -> list:
@@ -631,6 +660,23 @@ class Database:
         self.conn.executemany(
             "INSERT INTO pref_activity_colors (activity_type, color) VALUES (?, ?)",
             colors.items(),
+        )
+        self.conn.commit()
+
+    def get_current_levels(self) -> dict:
+        """Returns {(language, system): level} for every assumed-current-level
+        the user has recorded (e.g. {("ja", "CEFR"): "B1"})."""
+        return {(r[0], r[1]): r[2] for r in self.conn.execute(
+            "SELECT language, system, level FROM pref_current_level"
+        )}
+
+    def save_current_levels(self, levels: dict):
+        """levels: {(language, system): level}. A missing or empty level for a
+        given (language, system) clears any previously-saved assumption."""
+        self.conn.execute("DELETE FROM pref_current_level")
+        self.conn.executemany(
+            "INSERT INTO pref_current_level (language, system, level) VALUES (?, ?, ?)",
+            [(lang, system, level) for (lang, system), level in levels.items() if level],
         )
         self.conn.commit()
 
@@ -691,6 +737,7 @@ class FilterBar(ttk.Frame):
             values=["All", "(No language)"] + self.db.pref_languages(), width=_lang_w, state="readonly",
         )
         self.cb_lang.pack(side=tk.LEFT, padx=(4, 10))
+        self.cb_lang.bind("<<ComboboxSelected>>", lambda e: self._on_refresh())
 
         eight_ago = (date.today() - timedelta(weeks=8)).isoformat()
         ttk.Label(self, text="From:").pack(side=tk.LEFT)
@@ -714,7 +761,7 @@ class FilterBar(ttk.Frame):
         self.var_preset = tk.StringVar()
         cb_preset = ttk.Combobox(
             self, textvariable=self.var_preset,
-            values=["Last week", "Last month", "Last 3 months", "Last 6 months", "Last year"],
+            values=["Last week", "Last month", "Last 3 months", "Last 6 months", "Last year", "All time"],
             width=13, state="readonly",
         )
         cb_preset.pack(side=tk.LEFT, padx=(4, 10))
@@ -725,6 +772,16 @@ class FilterBar(ttk.Frame):
     def _apply_preset(self, event=None):
         preset = self.var_preset.get()
         today  = date.today()
+        if preset == "All time":
+            earliest = self.db.earliest_session_date(self.lang_code)
+            if earliest is None:
+                messagebox.showinfo("All time", "No sessions logged yet"
+                                     + ("" if self.lang_code is None else f" for {self.lang_display}") + ".")
+                return
+            self.var_start.set(earliest)
+            self.var_end.set(today.isoformat())
+            self._on_refresh()
+            return
         starts = {
             "Last week":     today - timedelta(weeks=1),
             "Last month":    _months_ago(1),
@@ -1693,7 +1750,9 @@ class CumulativeTab(ttk.Frame):
 class LearningTimeTab(ttk.Frame):
     """Static reference table: how long it typically takes to learn a language,
     based on FSI difficulty categories. Highlights languages the user has
-    actually logged sessions for."""
+    actually logged sessions for. Has a "Vocabulary" sub-tab (`VocabTab`,
+    built against this tab's own inner `Notebook`) — the two are related
+    static-reference views, so they share a spot on the top-level notebook."""
 
     def __init__(self, parent, db: Database):
         super().__init__(parent)
@@ -1702,22 +1761,30 @@ class LearningTimeTab(ttk.Frame):
         self._build()
 
     def _build(self):
-        frame = ttk.Frame(self, padding=10)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(1, weight=1)
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        sub = ttk.Notebook(outer)
+        sub.grid(row=0, column=0, sticky=tk.NSEW)
+
+        time_frame = ttk.Frame(sub)
+        sub.add(time_frame, text="  Learning Time  ")
+        time_frame.columnconfigure(0, weight=1)
+        time_frame.rowconfigure(1, weight=1)
 
         ttk.Label(
-            frame,
+            time_frame,
             text=("Estimated study time to reach professional working proficiency, based on the "
                   "U.S. Foreign Service Institute's language difficulty categories (assumes roughly "
                   "25 classroom hours/week; self-study usually takes longer). Rows highlighted in "
                   "green are languages you've already logged sessions for."),
             foreground="gray", wraplength=860, justify=tk.LEFT,
-        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
+        ).grid(row=0, column=0, sticky=tk.W, pady=(8, 8), padx=2)
 
         columns = ("language", "category", "hours", "weeks", "note")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(time_frame, columns=columns, show="headings", selectmode="browse")
         col_cfg = [
             ("language", "Language",         160),
             ("category", "FSI Category",     100),
@@ -1729,12 +1796,15 @@ class LearningTimeTab(ttk.Frame):
             self.tree.heading(col_id, text=heading, command=lambda c=col_id: self._sort(c))
             self.tree.column(col_id, width=width, anchor=tk.W)
 
-        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        vsb = ttk.Scrollbar(time_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.grid(row=1, column=0, sticky=tk.NSEW)
         vsb.grid(row=1, column=1, sticky=tk.NS)
 
         self.tree.tag_configure("studied", background="#dcf0dc")
+
+        self.tab_vocab = VocabTab(sub, self.db)
+        sub.add(self.tab_vocab, text="  Vocabulary  ")
 
         self.refresh()
 
@@ -1759,19 +1829,19 @@ class LearningTimeTab(ttk.Frame):
             )
         _sort_treeview(self.tree, self._sort_state["column"], self._sort_state,
                        numeric_columns=("hours", "weeks"), reverse=self._sort_state["reverse"])
+        self.tab_vocab.refresh()
 
     def _sort(self, column):
         _sort_treeview(self.tree, column, self._sort_state, numeric_columns=("hours", "weeks"))
 
 
-# ---------------------------------------------------------------------------
-# Tab 6 — Vocabulary
-# ---------------------------------------------------------------------------
-
 class VocabTab(ttk.Frame):
     """Reference table: approximate vocabulary size needed per proficiency
-    level, for the user's enabled languages. Shows CEFR estimates for every
-    language, plus the language's own scale (HSK/JLPT/TOPIK) where one exists."""
+    level, for the user's enabled languages. Used as LearningTimeTab's
+    "Vocabulary" sub-tab, so it's built against that tab's own inner
+    `Notebook` rather than added to the app's top-level tabs. Shows CEFR
+    estimates for every language, plus the language's own scale
+    (HSK/JLPT/TOPIK) where one exists."""
 
     def __init__(self, parent, db: Database):
         super().__init__(parent)
@@ -1849,14 +1919,116 @@ class VocabTab(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
-# Tab 7 — Projection
+# Tab 6 — Projection (CurrentLevelTab is its "Current Level" sub-tab)
 # ---------------------------------------------------------------------------
+
+class CurrentLevelTab(ttk.Frame):
+    """Lets you record your actual assumed level per language — CEFR, plus
+    the language's own scale where one exists — for cases where you already
+    knew some of a language before you started logging sessions here. Used
+    as ProjectionTab's "Current Level" sub-tab, so it's built against the
+    same `Notebook`/`db` rather than added to the app's top-level tabs. Saved
+    to the `pref_current_level` table and read by ProjectionTab, which treats
+    it as a floor: it won't project you as needing to reach a level you've
+    already assessed yourself at, and projects levels above it starting from
+    whichever is higher, your assumed level or your actually-logged hours."""
+
+    def __init__(self, parent, db: Database, on_saved=None):
+        super().__init__(parent)
+        self.db        = db
+        self._on_saved = on_saved
+        self._vars     = {}   # {(lang_code, system_name): tk.StringVar}
+        self._build()
+
+    def _build(self):
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            frame,
+            text=("Set your actual current level, for your enabled languages (Settings → Languages), "
+                  "if you already knew some of it before logging sessions here. The Projection tab "
+                  "will treat any level at or below this as already reached, and project levels above "
+                  "it from whichever is higher: this assumed level, or your actually-logged hours."),
+            foreground="gray", wraplength=860, justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
+
+        outer = ttk.Frame(frame)
+        outer.grid(row=1, column=0, sticky=tk.NSEW)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky=tk.NSEW)
+        vsb.grid(row=0, column=1, sticky=tk.NS)
+
+        self._rows_frame = ttk.Frame(canvas)
+        self._rows_win = canvas.create_window((0, 0), window=self._rows_frame, anchor=tk.NW)
+        self._rows_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(self._rows_win, width=e.width))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Button(btn_row, text="Save", command=self._save).pack(side=tk.LEFT)
+
+        self.refresh()
+
+    def refresh(self):
+        for w in self._rows_frame.winfo_children():
+            w.destroy()
+        self._vars.clear()
+
+        saved = self.db.get_current_levels()
+        codes = [_extract_lang_code(o) for o in self.db.pref_languages()]
+
+        if not codes:
+            ttk.Label(self._rows_frame, text="No languages enabled — enable some in Settings → Languages.",
+                      foreground="gray").pack(anchor=tk.W, padx=2, pady=2)
+            return
+
+        header = ttk.Frame(self._rows_frame)
+        header.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(header, text="Language",      width=22, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(header, text="System",        width=10, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(header, text="Assumed Level", width=16, font=("", 9, "bold")).pack(side=tk.LEFT)
+
+        for code in codes:
+            name = _lang_display(code) or code
+            systems = [("CEFR", CEFR_WORD_COUNTS)]
+            native = NATIVE_LEVEL_SYSTEMS.get(code)
+            if native:
+                systems.append(native)
+            for system_name, word_counts in systems:
+                row = ttk.Frame(self._rows_frame)
+                row.pack(fill=tk.X, pady=2)
+                ttk.Label(row, text=name, width=22).pack(side=tk.LEFT, padx=(2, 6))
+                ttk.Label(row, text=system_name, width=10).pack(side=tk.LEFT, padx=(0, 6))
+                var = tk.StringVar(value=saved.get((code, system_name)) or "(Not set)")
+                cb = ttk.Combobox(
+                    row, textvariable=var, state="readonly", width=14,
+                    values=["(Not set)"] + [level for level, _words in word_counts],
+                )
+                cb.pack(side=tk.LEFT)
+                self._vars[(code, system_name)] = var
+
+    def _save(self):
+        levels = {key: ("" if var.get() == "(Not set)" else var.get()) for key, var in self._vars.items()}
+        self.db.save_current_levels(levels)
+        if self._on_saved:
+            self._on_saved()
+        messagebox.showinfo("Saved", "Assumed levels saved.")
+
 
 class ProjectionTab(ttk.Frame):
     """For each language you've actually logged sessions for, projects how
     many more days of study — at your historical average daily pace for that
-    language — it would take to reach each CEFR level, plus a breakdown of
-    the incremental effort each level-up step takes on its own."""
+    language, or a custom assumed pace — it would take to reach each CEFR
+    level, plus a breakdown of the incremental effort each level-up step
+    takes on its own."""
 
     # (singular label, plural label, days-per-unit)
     _PACE_UNITS = [("Day", "Days", 1), ("Week", "Weeks", 7), ("Month", "Months", 30), ("Year", "Years", 365)]
@@ -1870,16 +2042,16 @@ class ProjectionTab(ttk.Frame):
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(4, weight=1)
+        frame.rowconfigure(5, weight=1)
 
         ttk.Label(
             frame,
             text=("Projects how many more days of study it would take to reach each CEFR level "
-                  "(plus HSK/JLPT/TOPIK where the language has its own scale), using your historical "
-                  "average daily pace for that language (total logged minutes spread over the days "
-                  "since your first session) and the same FSI/CEFR estimates as the Learning Time and "
-                  "Vocabulary tabs. Rough approximation only — assumes your past pace continues and "
-                  "that study time converts to vocabulary at a constant rate."),
+                  "(plus HSK/JLPT/TOPIK where the language has its own scale), using either your "
+                  "historical average daily pace for that language or a custom assumed pace, and the "
+                  "same FSI/CEFR estimates as the Learning Time and Vocabulary tabs. Rough "
+                  "approximation only — assumes the chosen pace continues and that study time "
+                  "converts to vocabulary at a constant rate."),
             foreground="gray", wraplength=860, justify=tk.LEFT,
         ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
 
@@ -1903,13 +2075,32 @@ class ProjectionTab(ttk.Frame):
         self.lbl_unit = ttk.Label(pace_row, text=self._PACE_UNITS[0][0], width=6)
         self.lbl_unit.pack(side=tk.LEFT)
 
+        pace_src_row = ttk.Frame(frame)
+        pace_src_row.grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
+        ttk.Label(pace_src_row, text="Pace used for projections:").pack(side=tk.LEFT)
+        self.var_pace_mode = tk.StringVar(value="average")
+        ttk.Radiobutton(
+            pace_src_row, text="My historical average", value="average",
+            variable=self.var_pace_mode, command=self._populate,
+        ).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Radiobutton(
+            pace_src_row, text="Custom:", value="custom",
+            variable=self.var_pace_mode, command=self._populate,
+        ).pack(side=tk.LEFT)
+        self.var_custom_minutes = tk.StringVar(value="60")
+        custom_entry = ttk.Entry(pace_src_row, textvariable=self.var_custom_minutes, width=6)
+        custom_entry.pack(side=tk.LEFT, padx=(4, 4))
+        custom_entry.bind("<Return>", lambda e: self._populate())
+        custom_entry.bind("<FocusOut>", lambda e: self._populate())
+        ttk.Label(pace_src_row, text="minutes/day").pack(side=tk.LEFT)
+
         self.var_status = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.var_status, foreground="#555555", anchor=tk.W).grid(
-            row=3, column=0, sticky=tk.EW, padx=2, pady=(0, 4)
+            row=4, column=0, sticky=tk.EW, padx=2, pady=(0, 4)
         )
 
         sub = ttk.Notebook(frame)
-        sub.grid(row=4, column=0, columnspan=2, sticky=tk.NSEW)
+        sub.grid(row=5, column=0, columnspan=2, sticky=tk.NSEW)
 
         to_level_frame = ttk.Frame(sub)
         sub.add(to_level_frame, text="  To Reach Level  ")
@@ -1969,6 +2160,10 @@ class ProjectionTab(ttk.Frame):
         self.tree_incremental.configure(yscrollcommand=vsb2.set)
         self.tree_incremental.grid(row=1, column=0, sticky=tk.NSEW)
         vsb2.grid(row=1, column=1, sticky=tk.NS)
+        self.tree_incremental.tag_configure("reached", background="#dcf0dc")
+
+        self.tab_curlevel = CurrentLevelTab(sub, self.db, on_saved=self._populate)
+        sub.add(self.tab_curlevel, text="  Current Level  ")
 
         self.refresh()
 
@@ -1990,6 +2185,7 @@ class ProjectionTab(ttk.Frame):
         self.cb_lang["values"] = ["All"] + options
         if self.var_lang.get() not in self.cb_lang["values"]:
             self.var_lang.set("All")
+        self.tab_curlevel.refresh()
         self._populate()
 
     def _populate(self):
@@ -2003,18 +2199,33 @@ class ProjectionTab(ttk.Frame):
             self.var_status.set("No sessions logged yet for a rated language — log some practice to see projections.")
             return
 
+        pace_mode = self.var_pace_mode.get()
+        custom_daily_minutes = None
+        if pace_mode == "custom":
+            try:
+                custom_daily_minutes = float(self.var_custom_minutes.get())
+                if custom_daily_minutes <= 0:
+                    raise ValueError
+            except ValueError:
+                self.var_status.set("Enter a positive number of minutes/day for the custom pace.")
+                return
+
         selected = self.var_lang.get()
         codes = studied if selected == "All" else [_extract_lang_code(selected)]
         self.var_status.set("")
         _unit_name, _unit_plural, unit_multiplier = self._PACE_UNITS[self.var_unit_idx.get()]
+        current_levels = self.db.get_current_levels()
 
         for code in codes:
             total_minutes, first_date, last_date, _count = self.db.language_time_stats(code)
             category, _estimated = LANGUAGE_DIFFICULTY[code]
             name = _lang_display(code) or code
-            span_days = (datetime.strptime(last_date, "%Y-%m-%d").date()
-                         - datetime.strptime(first_date, "%Y-%m-%d").date()).days + 1
-            avg_daily_minutes = total_minutes / span_days
+            if custom_daily_minutes is not None:
+                avg_daily_minutes = custom_daily_minutes
+            else:
+                span_days = (datetime.strptime(last_date, "%Y-%m-%d").date()
+                             - datetime.strptime(first_date, "%Y-%m-%d").date()).days + 1
+                avg_daily_minutes = total_minutes / span_days
             pace_display = _fmt_time(avg_daily_minutes * unit_multiplier)
 
             systems = [("CEFR", CEFR_WORD_COUNTS)]
@@ -2023,11 +2234,20 @@ class ProjectionTab(ttk.Frame):
                 systems.append(native)
 
             for system_name, word_counts in systems:
+                assumed_level = current_levels.get((code, system_name))
+                assumed_words = dict(word_counts).get(assumed_level) if assumed_level else None
                 for level, words, hours_needed, days_remaining, target_date in _project_levels(
-                    total_minutes, first_date, last_date, category, word_counts=word_counts
+                    total_minutes, first_date, last_date, category, word_counts=word_counts,
+                    assumed_level=assumed_level, avg_daily_minutes=avg_daily_minutes,
                 ):
                     if days_remaining is None:
-                        tags, days_display, target_display = ("reached",), "Reached", "Already reached (est.)"
+                        tags = ("reached",)
+                        days_display = "Reached"
+                        if assumed_words is not None and words <= assumed_words \
+                                and hours_needed > total_minutes / 60:
+                            target_display = f"Already reached (assumed {assumed_level})"
+                        else:
+                            target_display = "Already reached (est.)"
                     elif target_date is None:
                         tags = ()
                         days_display   = _format_days_in_unit(days_remaining, unit_multiplier)
@@ -2043,17 +2263,25 @@ class ProjectionTab(ttk.Frame):
                         tags=tags,
                     )
 
+                words_map = dict(word_counts)
                 for level, words_added, hours_added in _incremental_levels(category, word_counts=word_counts):
-                    days_needed = math.ceil(hours_added * 60 / avg_daily_minutes)
+                    if assumed_words is not None and words_map[level] <= assumed_words:
+                        days_display2 = "Done"
+                        incr_tags = ("reached",)
+                    else:
+                        days_needed = math.ceil(hours_added * 60 / avg_daily_minutes)
+                        days_display2 = _format_days_in_unit(days_needed, unit_multiplier)
+                        incr_tags = ()
                     self.tree_incremental.insert(
                         "", tk.END,
                         values=(name, system_name, level, f"+{words_added:,}", f"+{hours_added:.0f}",
-                                pace_display, _format_days_in_unit(days_needed, unit_multiplier)),
+                                pace_display, days_display2),
+                        tags=incr_tags,
                     )
 
 
 # ---------------------------------------------------------------------------
-# Tab 8 — Settings
+# Tab 7 — Settings
 # ---------------------------------------------------------------------------
 
 class SettingsTab(ttk.Frame):
@@ -2350,7 +2578,6 @@ class LanguageLoggerApp(tk.Tk):
         self.tab_stats      = StatsTab(self.notebook, db)
         self.tab_cumul      = CumulativeTab(self.notebook, db)
         self.tab_learntime  = LearningTimeTab(self.notebook, db)
-        self.tab_vocab      = VocabTab(self.notebook, db)
         self.tab_projection = ProjectionTab(self.notebook, db)
         self.tab_settings   = SettingsTab(self.notebook, db, on_prefs_changed=self._on_prefs_changed)
 
@@ -2359,7 +2586,6 @@ class LanguageLoggerApp(tk.Tk):
         self.notebook.add(self.tab_stats,      text="  Stats  ")
         self.notebook.add(self.tab_cumul,      text="  Cumulative  ")
         self.notebook.add(self.tab_learntime,  text="  Learning Time  ")
-        self.notebook.add(self.tab_vocab,      text="  Vocabulary  ")
         self.notebook.add(self.tab_projection, text="  Projection  ")
         self.notebook.add(self.tab_settings,   text="  Settings  ")
         self.notebook.add(self.tab_timer,      text="  Timer  ")
@@ -2378,7 +2604,7 @@ class LanguageLoggerApp(tk.Tk):
         self.tab_log.refresh_prefs()
         self.tab_stats.refresh_prefs()
         self.tab_cumul.refresh_prefs()
-        self.tab_vocab.refresh()
+        self.tab_learntime.tab_vocab.refresh()
 
     def _on_tab_change(self, event):
         selected = self.notebook.select()

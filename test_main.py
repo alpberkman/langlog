@@ -49,8 +49,8 @@ class TestFmtTime(unittest.TestCase):
     def test_hours_and_minutes(self):
         self.assertEqual(main._fmt_time(90), "01:30")
 
-    def test_rolls_over_into_days(self):
-        self.assertEqual(main._fmt_time(1500), "01:01:00")  # 1440 + 60
+    def test_stays_hours_and_minutes_past_a_day(self):
+        self.assertEqual(main._fmt_time(1500), "25:00")  # 1440 + 60
 
     def test_rounds_fractional_minutes(self):
         self.assertEqual(main._fmt_time(59.6), "01:00")
@@ -207,6 +207,44 @@ class TestProjectLevels(unittest.TestCase):
         self.assertIsNotNone(c1.days_remaining)
         self.assertGreater(c1.days_remaining, 365 * 1000)
 
+    def test_assumed_level_marks_lower_levels_reached_despite_low_hours(self):
+        # Only 1 hour logged, but the caller says they already know B1 —
+        # A1/A2/B1 should read as reached, B2+ should not.
+        results = main._project_levels(
+            total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01",
+            fsi_category="III", today=date(2026, 1, 1), assumed_level="B1",
+        )
+        levels = {r.level: r for r in results}
+        for lvl in ("A1", "A2", "B1"):
+            self.assertIsNone(levels[lvl].days_remaining, lvl)
+        for lvl in ("B2", "C1", "C2"):
+            self.assertIsNotNone(levels[lvl].days_remaining, lvl)
+
+    def test_assumed_level_projects_higher_levels_from_its_own_baseline(self):
+        # With trivial actual hours, days_remaining for B2 should be computed
+        # from B1's hours_needed (the assumed floor), not from 1 hour studied.
+        with_assumed = main._project_levels(
+            total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01",
+            fsi_category="III", today=date(2026, 1, 1), assumed_level="B1",
+        )
+        without_assumed = main._project_levels(
+            total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01",
+            fsi_category="III", today=date(2026, 1, 1),
+        )
+        b2_with = next(r for r in with_assumed if r.level == "B2")
+        b2_without = next(r for r in without_assumed if r.level == "B2")
+        self.assertLess(b2_with.days_remaining, b2_without.days_remaining)
+
+    def test_unknown_assumed_level_is_ignored(self):
+        # A level label that isn't in word_counts shouldn't blow up or change anything.
+        kwargs = dict(
+            total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01",
+            fsi_category="III", today=date(2026, 1, 1),
+        )
+        with_bogus = main._project_levels(**kwargs, assumed_level="not-a-real-level")
+        without    = main._project_levels(**kwargs)
+        self.assertEqual(with_bogus, without)
+
 
 class TestIncrementalLevels(unittest.TestCase):
     def test_first_level_added_equals_its_own_total(self):
@@ -335,6 +373,14 @@ class TestDatabase(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(self.tmpdir, "bare.db")))
         finally:
             os.chdir(cwd)
+
+    def test_current_levels_round_trip_and_empty_values_clear(self):
+        self.assertEqual(self.db.get_current_levels(), {})
+        self.db.save_current_levels({("ja", "CEFR"): "B1", ("ja", "JLPT"): "N4"})
+        self.assertEqual(self.db.get_current_levels(), {("ja", "CEFR"): "B1", ("ja", "JLPT"): "N4"})
+        # Saving again with an empty value for one key clears it (no stale rows).
+        self.db.save_current_levels({("ja", "CEFR"): "B1", ("ja", "JLPT"): ""})
+        self.assertEqual(self.db.get_current_levels(), {("ja", "CEFR"): "B1"})
 
     def test_fresh_db_has_no_languages_enabled_but_falls_back_to_all(self):
         self.assertEqual(self.db.enabled_lang_codes(), set())
@@ -572,6 +618,73 @@ class TestProjectionTabPaceSlider(unittest.TestCase):
         self.db.insert_session("ja", "Reading", None, 0, "2020-01-01", None)
         self.tab._populate()
         self.assertEqual(self._first_row(self.tab.tree, "target_date"), "Not estimable")
+
+
+@unittest.skipUnless(os.environ.get("DISPLAY"), "no DISPLAY available for Tkinter widget tests")
+class TestProjectionTabCustomPaceAndCurrentLevel(unittest.TestCase):
+    """The Projection tab can use a custom assumed daily pace instead of the
+    historical average, and a per-language/system assumed current level (set
+    on its nested "Current Level" sub-tab) that both tables should respect."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = main.tk.Tk()
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.root.destroy()
+
+    def setUp(self):
+        self.db, self.tmpdir = _make_test_db()
+        self.db.insert_session("ja", "Reading", None, 20, "2026-08-01", None)
+        self.tab = main.ProjectionTab(self.root, self.db)
+        self.tab.var_lang.set("Japanese (ja)")
+        self.tab._populate()
+
+    def tearDown(self):
+        self.tab.destroy()
+        self.db.conn.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _first_row(self, tree, column, system="CEFR"):
+        for iid in tree.get_children():
+            if tree.set(iid, "system") == system:
+                return tree.set(iid, column)
+        raise AssertionError(f"no {system} row found")
+
+    def test_custom_pace_overrides_historical_average(self):
+        self.tab.var_pace_mode.set("custom")
+        self.tab.var_custom_minutes.set("120")
+        self.tab._populate()
+        self.assertEqual(self._first_row(self.tab.tree, "pace"), main._fmt_time(120))
+
+    def test_invalid_custom_pace_shows_status_and_clears_tables(self):
+        self.tab.var_pace_mode.set("custom")
+        self.tab.var_custom_minutes.set("not-a-number")
+        self.tab._populate()
+        self.assertIn("positive number", self.tab.var_status.get())
+        self.assertEqual(self.tab.tree.get_children(), ())
+
+    def test_current_level_sub_tab_is_nested_in_projection(self):
+        self.assertIsInstance(self.tab.tab_curlevel, main.CurrentLevelTab)
+
+    def test_assumed_level_marks_lower_levels_reached_in_both_tables(self):
+        for (code, system), var in self.tab.tab_curlevel._vars.items():
+            if code == "ja" and system == "CEFR":
+                var.set("B1")
+        self.tab.tab_curlevel._save()  # also triggers ProjectionTab._populate via on_saved
+
+        by_level = {self.tab.tree.set(iid, "level"): self.tab.tree.set(iid, "days_remaining")
+                    for iid in self.tab.tree.get_children() if self.tab.tree.set(iid, "system") == "CEFR"}
+        self.assertEqual(by_level["B1"], "Reached")
+        self.assertNotEqual(by_level["B2"], "Reached")
+
+        by_level2 = {self.tab.tree_incremental.set(iid, "level"): self.tab.tree_incremental.set(iid, "days_needed")
+                     for iid in self.tab.tree_incremental.get_children()
+                     if self.tab.tree_incremental.set(iid, "system") == "CEFR"}
+        self.assertEqual(by_level2["B1"], "Done")
+        self.assertNotEqual(by_level2["B2"], "Done")
 
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "no DISPLAY available for Tkinter widget tests")
