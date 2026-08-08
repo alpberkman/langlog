@@ -1888,7 +1888,9 @@ class VocabTab(ttk.Frame):
         self.tree.grid(row=2, column=0, sticky=tk.NSEW)
         vsb.grid(row=2, column=1, sticky=tk.NS)
 
-        self.refresh()
+        # No initial self.refresh() here — LearningTimeTab._build() calls it
+        # via self.refresh() right after construction; populating here too
+        # would insert every row twice at startup.
 
     def refresh(self):
         enabled = self.db.pref_languages()
@@ -1975,7 +1977,9 @@ class CurrentLevelTab(ttk.Frame):
         btn_row.grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
         ttk.Button(btn_row, text="Save", command=self._save).pack(side=tk.LEFT)
 
-        self.refresh()
+        # No initial self.refresh() here — ProjectionTab._build() calls it via
+        # self.refresh() right after construction; populating here too would
+        # rebuild every row twice at startup.
 
     def refresh(self):
         for w in self._rows_frame.winfo_children():

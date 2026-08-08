@@ -222,7 +222,8 @@ class TestProjectLevels(unittest.TestCase):
 
     def test_assumed_level_projects_higher_levels_from_its_own_baseline(self):
         # With trivial actual hours, days_remaining for B2 should be computed
-        # from B1's hours_needed (the assumed floor), not from 1 hour studied.
+        # starting from B1's hours_needed (the pre-logging baseline), not from
+        # 1 hour studied.
         with_assumed = main._project_levels(
             total_minutes=60, first_date_str="2026-01-01", last_date_str="2026-01-01",
             fsi_category="III", today=date(2026, 1, 1), assumed_level="B1",
@@ -234,6 +235,22 @@ class TestProjectLevels(unittest.TestCase):
         b2_with = next(r for r in with_assumed if r.level == "B2")
         b2_without = next(r for r in without_assumed if r.level == "B2")
         self.assertLess(b2_with.days_remaining, b2_without.days_remaining)
+
+    def test_assumed_level_is_additive_baseline_not_a_floor(self):
+        # Hours logged since starting should accumulate ON TOP of the assumed
+        # pre-logging level, not just be compared against it in isolation —
+        # logging more should keep closing the gap to B2, never plateau once
+        # logged hours alone would exceed B1's hours_needed.
+        kwargs = dict(first_date_str="2026-01-01", last_date_str="2026-01-01",
+                       fsi_category="III", today=date(2026, 1, 1), assumed_level="B1")
+        few_hours  = main._project_levels(total_minutes=10 * 60, **kwargs)
+        many_hours = main._project_levels(total_minutes=300 * 60, **kwargs)
+        b2_few  = next(r for r in few_hours if r.level == "B2")
+        b2_many = next(r for r in many_hours if r.level == "B2")
+        self.assertIsNotNone(b2_few.days_remaining)
+        self.assertLess(b2_many.days_remaining or 0, b2_few.days_remaining)
+        # 275 (B1 hours_needed) + 300 logged hours comfortably clears B2's 550.
+        self.assertIsNone(b2_many.days_remaining)
 
     def test_unknown_assumed_level_is_ignored(self):
         # A level label that isn't in word_counts shouldn't blow up or change anything.
